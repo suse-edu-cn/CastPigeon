@@ -1,0 +1,55 @@
+# ====================================================================
+# 1. macOS 系统级规范忽略
+# ====================================================================
+.DS_Store
+**/.DS_Store
+*.icu
+.AppleDouble
+.LSOverride
+
+# ====================================================================
+# 2. IDE 与工程配置文件忽略（针对 IntelliJ, Android Studio, Xcode）
+# ====================================================================
+*.iml
+*.ipr
+*.iws
+.idea/
+.kotlin/
+**/.kotlin/
+.gradle/
+**/.gradle/
+/local.properties
+.captures/
+.externalNativeBuild/
+.cxx/
+
+# ====================================================================
+# 3. 核心构建产物忽略（针对 Gradle, Kotlin Multiplatform）
+# ====================================================================
+build/
+**/build/
+.ncBuildConfig/
+
+# ====================================================================
+# 4. macOS / iOS / Xcode 特异性忽略（防止 Swift 编译中间产物穿透）
+# ====================================================================
+# 忽略 Xcode 所有的本地用户数据与衍生数据
+**/xcuserdata/
+**/DerivedData/
+**/Build/
+**/.build/
+**/.swiftpm/
+
+# 忽略 Xcode 自动化管理文件，但保留核心工程结构文件
+*.xcodeproj/*
+!*.xcodeproj/project.pbxproj
+!*.xcodeproj/xcshareddata/
+!*.xcodeproj/project.xcworkspace/
+!*.xcworkspace/contents.xcworkspacedata
+**/xcshareddata/WorkspaceSettings.xcsettings
+**/Pods/
+
+# ====================================================================
+# 5. 其他依赖组件忽略
+# ====================================================================
+node_modules/

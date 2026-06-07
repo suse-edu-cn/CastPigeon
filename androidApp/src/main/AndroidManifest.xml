@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        通知监听服务必须声明的系统级权限。
+        BIND_NOTIFICATION_LISTENER_SERVICE 是签名级 (signature) 权限,
+        只有系统进程可以授予。用户在"设置 > 通知使用权"中手动开启后,
+        系统自动绑定此服务。
+    -->
+    <uses-permission android:name="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE" />
+
+    <!--
+        Android 13 (API 33) 起, 发送通知前必须声明此权限。
+        此处声明后, 应用可在"设置 > 通知 > 应用通知"中被用户授权。
+    -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+        Android 9 (API 28) 起, 前台服务需要此权限。
+        NotificationListenerService 自身不需要前台服务, 但若未来
+        需要添加保活前台通知 (解决部分 OEM 杀进程问题), 则需要此权限。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!--
+        Android 14 (API 34) 起, 前台服务必须声明具体的服务类型。
+        dataSync 类型适用于本应用的场景: 在本地网络/蓝牙通道中
+        将 Android 通知数据同步至 macOS 桌面端。
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <!--
+            NotificationListenerService 声明:
+            - exported="true": 允许系统进程绑定此服务
+            - permission: 限制只有持有 BIND_NOTIFICATION_LISTENER_SERVICE 的系统进程才能绑定
+            - foregroundServiceType: API 34+ 要求的前台服务类型声明
+        -->
+        <service
+            android:name=".service.MyNotificationListener"
+            android:exported="true"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:foregroundServiceType="dataSync"
+            android:label="@string/notification_listener_service_label"
+            android:description="@string/notification_listener_service_description">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+        <activity
+            android:exported="true"
+            android:name=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+</manifest>
