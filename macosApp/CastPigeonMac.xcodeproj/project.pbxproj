@@ -9,12 +9,14 @@
 /* Begin PBXBuildFile section */
 		5273E93FBAFBEF5BF368F5AC /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2FB73B0F10A5986B13E0997 /* Models.swift */; };
 		795A7E478C354CAE4682837F /* MainViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07817A75C6CA871F9C56B19A /* MainViewModel.swift */; };
+		86A98E23A7D08F420C1F3918 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1D47AA670EC895E76B39DAC9 /* Assets.xcassets */; };
 		A1B2C3D4E5F6A7B8C9D0E100 /* App.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1B2C3D4E5F6A7B8C9D0E200 /* App.swift */; };
 		BE34590FB7CBDF9D2C6D46D1 /* SwiftUdpDiscovery.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48883F9F2A98DBC7B8BE3DF3 /* SwiftUdpDiscovery.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		07817A75C6CA871F9C56B19A /* MainViewModel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MainViewModel.swift; sourceTree = "<group>"; };
+		1D47AA670EC895E76B39DAC9 /* Assets.xcassets */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = folder.assetcatalog; name = Assets.xcassets; path = CastPigeonMac/Assets.xcassets; sourceTree = "<group>"; };
 		48883F9F2A98DBC7B8BE3DF3 /* SwiftUdpDiscovery.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SwiftUdpDiscovery.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F6A7B8C9D0E200 /* App.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = App.swift; sourceTree = "<group>"; };
 		A1B2C3D4E5F6A7B8C9D0E202 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
@@ -47,6 +49,7 @@
 			children = (
 				A1B2C3D4E5F6A7B8C9D0E401 /* CastPigeonMac */,
 				A1B2C3D4E5F6A7B8C9D0E402 /* Products */,
+				1D47AA670EC895E76B39DAC9 /* Assets.xcassets */,
 			);
 			sourceTree = "<group>";
 		};
@@ -97,6 +100,7 @@
 			buildPhases = (
 				A1B2C3D4E5F6A7B8C9D0E501 /* Sources */,
 				A1B2C3D4E5F6A7B8C9D0E300 /* Frameworks */,
+				38085BFE282CE4B3C5C16FF5 /* Resources */,
 			);
 			buildRules = (
 			);
@@ -139,6 +143,17 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		38085BFE282CE4B3C5C16FF5 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				86A98E23A7D08F420C1F3918 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		A1B2C3D4E5F6A7B8C9D0E501 /* Sources */ = {
@@ -196,6 +211,7 @@
 		A1B2C3D4E5F6A7B8C9D0E803 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
@@ -214,6 +230,7 @@
 		A1B2C3D4E5F6A7B8C9D0E804 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
