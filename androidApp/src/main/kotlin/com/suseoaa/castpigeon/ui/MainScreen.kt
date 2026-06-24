@@ -1,11 +1,8 @@
 @file:Suppress("UNUSED_VARIABLE", "UNUSED_PARAMETER", "USELESS_CAST", "RedundantRequireNotNullCall", "RemoveRedundantQualifierName", "UNUSED_IMPORT", "CanBeVal")
 package com.suseoaa.castpigeon.ui
 
-import android.Manifest
 import android.content.Context
 import android.os.Build
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
@@ -35,6 +32,7 @@ import kotlinx.coroutines.launch
 import java.security.MessageDigest
 import java.util.Date
 import com.suseoaa.castpigeon.AppManager
+import com.suseoaa.castpigeon.StartupPermissionCoordinator
 import com.suseoaa.castpigeon.shared.crypto.Crypto
 import kotlinx.serialization.encodeToString
 import com.suseoaa.castpigeon.service.AppConnectionManager
@@ -166,36 +164,8 @@ fun MainScreen(
 
     // 监听全局通知事件并发送 (已迁移至 BleForegroundService，此处移除以避免重复)
 
-    // 权限请求启动器
-    val permissionsToRequest = arrayOf(
-        Manifest.permission.BLUETOOTH_ADVERTISE,
-        Manifest.permission.BLUETOOTH_CONNECT,
-        Manifest.permission.BLUETOOTH_SCAN,
-        Manifest.permission.POST_NOTIFICATIONS
-    )
-    
-    fun hasAllPermissions(): Boolean {
-        return permissionsToRequest.all {
-            androidx.core.content.ContextCompat.checkSelfPermission(context, it) == android.content.pm.PackageManager.PERMISSION_GRANTED
-        }
-    }
-    
     // 触发动作状态
     var pendingAction by remember { mutableStateOf<WorkMode?>(null) }
-
-    val permissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) { permissions ->
-        val allGranted = permissions.entries.all { it.value }
-        android.util.Log.i("CastPigeonUI", "权限请求结果: allGranted=$allGranted, permissions=$permissions")
-        if (allGranted && pendingAction != null) {
-            val targetMode = pendingAction!!
-            pendingAction = null
-            startBluetoothAction(stateMachine, blePeripheral, bleCentral, role, targetMode, deviceHash, boundMacs, myName)
-        } else if (!allGranted) {
-            android.widget.Toast.makeText(context, "需要蓝牙相关权限才能工作！", android.widget.Toast.LENGTH_SHORT).show()
-        }
-    }
 
     // Role 持久化与自动启动
     LaunchedEffect(Unit) {
@@ -204,12 +174,14 @@ fun MainScreen(
             stateMachine.setRole(DeviceRole.valueOf(lastRoleStr))
         } catch (_: Exception) {}
 
-        // 每次启动都无条件检查并请求所有必需权限
-        // 首次安装或重装后权限被撤销时均会弹出权限申请对话框
         if (boundMacs.isNotEmpty()) {
-            pendingAction = WorkMode.Working
+            if (StartupPermissionCoordinator.missingRuntimePermissions(context).isEmpty()) {
+                startBluetoothAction(stateMachine, blePeripheral, bleCentral, role, WorkMode.Working, deviceHash, boundMacs, myName)
+            } else {
+                pendingAction = WorkMode.Working
+                android.widget.Toast.makeText(context, "请先授予启动阶段请求的权限", android.widget.Toast.LENGTH_SHORT).show()
+            }
         }
-        permissionLauncher.launch(permissionsToRequest)
     }
 
     LaunchedEffect(role) {
