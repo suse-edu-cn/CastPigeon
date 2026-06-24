@@ -35,5 +35,6 @@ expect class BlePeripheral() {
 *@parampayload经过序列化处理的字节数组，包含通知的标识、应用名、标题与正文。
 *注意：单包长度绝对不能超过509字节（由于MTU=512限制）。
 */
+    var onMessageReceived: ((String) -> Unit)?
     fun sendNotificationData(payload: ByteArray)
 }

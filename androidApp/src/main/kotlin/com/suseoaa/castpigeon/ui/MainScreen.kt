@@ -153,12 +153,7 @@ fun MainScreen(
         }
     }
 
-    var receivedMockMessage by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(bleCentral) {
-        bleCentral.onMessageReceived = { msg ->
-            receivedMockMessage = msg
-        }
-    }
+    val receivedMockMessage by com.suseoaa.castpigeon.service.AppConnectionManager.lastReceivedMessage.collectAsState()
 
     // 监听全局通知事件并发送 (已迁移至 BleForegroundService，此处移除以避免重复)
 

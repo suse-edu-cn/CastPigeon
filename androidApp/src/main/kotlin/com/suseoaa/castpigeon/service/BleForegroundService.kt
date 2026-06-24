@@ -20,6 +20,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import android.content.ClipboardManager
+import android.content.ClipData
+import android.widget.Toast
 
 class BleForegroundService : Service() {
 
@@ -42,10 +47,48 @@ class BleForegroundService : Service() {
     private lateinit var dbHelper: MessageDatabaseHelper
     private var isObserving = false
 
+    private val clipboardSyncReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == "com.suseoaa.castpigeon.ACTION_SYNC_CLIPBOARD") {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val text = clipboard.primaryClip?.getItemAt(0)?.text?.toString()
+                if (!text.isNullOrEmpty()) {
+                    val payload = "CLIP|$text"
+                    try {
+                        AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
+                        Toast.makeText(this@BleForegroundService, "已推送到 Mac", Toast.LENGTH_SHORT).show()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                } else {
+                    Toast.makeText(this@BleForegroundService, "剪贴板为空或无法访问", Toast.LENGTH_SHORT).show()
+                }
+            } else if (intent?.action == "com.suseoaa.castpigeon.ACTION_COPY_CLIPBOARD") {
+                val text = intent.getStringExtra("EXTRA_TEXT") ?: return
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clip = ClipData.newPlainText("CastPigeon", text)
+                clipboard.setPrimaryClip(clip)
+                Toast.makeText(this@BleForegroundService, "已复制到剪贴板", Toast.LENGTH_SHORT).show()
+                val id = intent.getIntExtra("EXTRA_NOTIF_ID", 1002)
+                val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                notificationManager.cancel(id)
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         dbHelper = MessageDatabaseHelper(this)
         createNotificationChannel()
+        
+        val filter = IntentFilter().apply {
+            addAction("com.suseoaa.castpigeon.ACTION_COPY_CLIPBOARD")
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(clipboardSyncReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(clipboardSyncReceiver, filter)
+        }
         if (Build.VERSION.SDK_INT >= 34) { // Build.VERSION_CODES.UPSIDE_DOWN_CAKE
             startForeground(NOTIFICATION_ID, buildNotification(dbHelper.getTodayMessageCount()), android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
@@ -63,6 +106,9 @@ class BleForegroundService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         isObserving = false
+        try {
+            unregisterReceiver(clipboardSyncReceiver)
+        } catch (e: Exception) { }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -95,6 +141,25 @@ class BleForegroundService : Service() {
             }
         }
 
+        // 监听来自 Mac 的直接消息 (例如剪贴板)
+        val handleMessage: (String) -> Unit = { msg ->
+            if (msg.startsWith("CLIP|")) {
+                val text = msg.substring(5)
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                try {
+                    val clip = ClipData.newPlainText("CastPigeon", text)
+                    clipboard.setPrimaryClip(clip)
+                    showClipboardNotification(text)
+                } catch (e: Exception) {
+                    showClipboardNotification(text)
+                }
+            } else {
+                AppConnectionManager.lastReceivedMessage.value = msg
+            }
+        }
+        AppConnectionManager.bleCentral.onMessageReceived = handleMessage
+        AppConnectionManager.blePeripheral.onMessageReceived = handleMessage
+
         // 监听连接状态以实现断线自动重连
         serviceScope.launch {
             AppConnectionManager.stateMachine.state.collect { state ->
@@ -123,6 +188,31 @@ class BleForegroundService : Service() {
         return bytes.copyOfRange(0, 4)
     }
 
+    private fun showClipboardNotification(text: String) {
+        val copyIntent = Intent("com.suseoaa.castpigeon.ACTION_COPY_CLIPBOARD").apply {
+            setPackage(packageName)
+            putExtra("EXTRA_TEXT", text)
+            putExtra("EXTRA_NOTIF_ID", 1002)
+        }
+        val copyPendingIntent = android.app.PendingIntent.getBroadcast(
+            this, 1, copyIntent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val preview = if (text.length > 30) text.take(30) + "..." else text
+        val notif = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setSmallIcon(com.suseoaa.castpigeon.R.mipmap.ic_launcher_round)
+            .setContentTitle("收到来自 Mac 的剪贴板")
+            .setContentText(preview)
+            .setPriority(NotificationCompat.PRIORITY_MAX)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setAutoCancel(true)
+            .addAction(0, "📋 点击复制", copyPendingIntent)
+            .build()
+            
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.notify(1002, notif)
+    }
+
     private fun updateNotification() {
         val count = dbHelper.getTodayMessageCount()
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -130,13 +220,20 @@ class BleForegroundService : Service() {
     }
 
     private fun buildNotification(count: Int): Notification {
+        val syncIntent = Intent(this, com.suseoaa.castpigeon.ui.TransparentClipboardActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        }
+        val syncPendingIntent = android.app.PendingIntent.getActivity(
+            this, 0, syncIntent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        )
+        
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            // 使用自定义的应用图标
             .setSmallIcon(com.suseoaa.castpigeon.R.mipmap.ic_launcher_round)
             .setContentTitle("CastPigeon 正在运行")
             .setContentText("今日已收到 $count 条消息")
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setOngoing(true)
+            .addAction(0, "✈️ 推送剪贴板至 Mac", syncPendingIntent)
             .build()
     }
 

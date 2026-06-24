@@ -22,6 +22,9 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     @Published var receivedMessage: String? = nil
     @Published var receivedImage: Data? = nil
     
+    private var clipboardTimer: Timer?
+    private var lastClipboardChangeCount: Int = NSPasteboard.general.changeCount
+    
     private var receiveBuffers: [UUID: Data] = [:]
     @Published var debugLogs: [String] = []
     
@@ -55,6 +58,10 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         super.init()
         centralManager = CBCentralManager(delegate: self, queue: nil)
         peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
+        
+        clipboardTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            self?.checkClipboard()
+        }
         
         if !boundDeviceHashes.isEmpty {
             self.workMode = .working
@@ -213,6 +220,16 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
         for request in requests {
             if request.characteristic.uuid == handshakeCharUuid {
+                if let data = request.value, let text = String(data: data, encoding: .utf8), text.hasPrefix("CLIP|") {
+                    let clipText = String(text.dropFirst(5))
+                    DispatchQueue.main.async {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(clipText, forType: .string)
+                        self.lastClipboardChangeCount = NSPasteboard.general.changeCount
+                    }
+                    peripheralManager.respond(to: request, withResult: .success)
+                    return
+                }
                 // Handshake received
                 peripheralManager.respond(to: request, withResult: .success)
                 updateState(name: "Handshake", desc: "收到手机连接握手...")
@@ -223,6 +240,35 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     func sendMockMessage(_ msg: String) {
         if let dataChar = gattCharacteristic, let data = msg.data(using: .utf8) {
             peripheralManager.updateValue(data, for: dataChar, onSubscribedCentrals: subscribedCentrals)
+        }
+    }
+
+    private func checkClipboard() {
+        guard workMode == .working else { return }
+        let currentCount = NSPasteboard.general.changeCount
+        guard currentCount != lastClipboardChangeCount else { return }
+        lastClipboardChangeCount = currentCount
+        
+        if let text = NSPasteboard.general.string(forType: .string) {
+            let payload = "CLIP|" + text
+            sendClipboardPayload(payload)
+        }
+    }
+    
+    private func sendClipboardPayload(_ payload: String) {
+        guard let data = payload.data(using: .utf8) else { return }
+        
+        // If Mac is Peripheral
+        if let dataChar = gattCharacteristic {
+            peripheralManager.updateValue(data, for: dataChar, onSubscribedCentrals: subscribedCentrals)
+        }
+        
+        // If Mac is Central
+        for peripheral in connectedPeripherals.values {
+            if let service = peripheral.services?.first(where: { $0.uuid == serviceUuid }),
+               let char = service.characteristics?.first(where: { $0.uuid == handshakeCharUuid }) {
+                peripheral.writeValue(data, for: char, type: .withResponse)
+            }
         }
     }
 
@@ -463,9 +509,16 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
                     receiveBuffers[peripheral.identifier]?.removeAll()
                     if let msg = String(data: completeData, encoding: .utf8) {
                         DispatchQueue.main.async {
-                            self.receivedMessage = msg
-                            let hash = self.peripheralHashes[peripheral.identifier] ?? "unknown"
-                            self.showNotification(from: completeData, deviceHash: hash)
+                            if msg.hasPrefix("CLIP|") {
+                                let clipText = String(msg.dropFirst(5))
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(clipText, forType: .string)
+                                self.lastClipboardChangeCount = NSPasteboard.general.changeCount
+                            } else {
+                                self.receivedMessage = msg
+                                let hash = self.peripheralHashes[peripheral.identifier] ?? "unknown"
+                                self.showNotification(from: completeData, deviceHash: hash)
+                            }
                         }
                     }
                 }

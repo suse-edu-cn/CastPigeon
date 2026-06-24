@@ -40,6 +40,7 @@ actual class BlePeripheral actual constructor() {
     private var characteristic: BluetoothGattCharacteristic? = null
     private var currentMtu = 23
     private var handshakeCharacteristic: BluetoothGattCharacteristic? = null
+    actual var onMessageReceived: ((String) -> Unit)? = null
 
     //CastPigeon专属的跨端通信UUID，用于广播和过滤
     private val serviceUuid = UUID.fromString("A1B2C3D4-E5F6-47A8-B9C0-D1E2F3A4B5C6")
@@ -99,6 +100,17 @@ actual class BlePeripheral actual constructor() {
             super.onCharacteristicWriteRequest(device, requestId, characteristic, preparedWrite, responseNeeded, offset, value)
             if (characteristic?.uuid == handshakeCharUuid) {
                 if (device == null) return
+                
+                val text = value?.let { String(it) }
+                if (text != null && text.startsWith("CLIP|")) {
+                    if (responseNeeded) {
+                        @SuppressLint("MissingPermission")
+                        gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
+                    }
+                    onMessageReceived?.invoke(text)
+                    return
+                }
+                
                 // 如果是工作模式下的握手包 (0x01)，直接进入传输期，解决首次消息延迟
                 if (value != null && value.size == 1 && value[0] == 0x01.toByte()) {
                     if (responseNeeded) {
