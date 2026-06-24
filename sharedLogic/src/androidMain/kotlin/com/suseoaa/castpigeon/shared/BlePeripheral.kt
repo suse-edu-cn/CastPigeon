@@ -41,6 +41,7 @@ actual class BlePeripheral actual constructor() {
     private var currentMtu = 23
     private var handshakeCharacteristic: BluetoothGattCharacteristic? = null
     actual var onMessageReceived: ((String) -> Unit)? = null
+    private val writeBuffers = java.util.concurrent.ConcurrentHashMap<String, java.io.ByteArrayOutputStream>()
 
     //CastPigeon专属的跨端通信UUID，用于广播和过滤
     private val serviceUuid = UUID.fromString("A1B2C3D4-E5F6-47A8-B9C0-D1E2F3A4B5C6")
@@ -101,36 +102,74 @@ actual class BlePeripheral actual constructor() {
             if (characteristic?.uuid == handshakeCharUuid) {
                 if (device == null) return
                 
-                val text = value?.let { String(it) }
-                if (text != null && text.startsWith("CLIP|")) {
+                if (preparedWrite) {
+                    // 分包写入（Prepare Write）：累加数据，直到 Execute Write 执行
+                    val buffer = writeBuffers.getOrPut(device.address) { java.io.ByteArrayOutputStream() }
+                    if (offset == 0) {
+                        buffer.reset()
+                    }
+                    if (value != null) {
+                        buffer.write(value)
+                    }
                     if (responseNeeded) {
                         @SuppressLint("MissingPermission")
                         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
                     }
-                    onMessageReceived?.invoke(text)
-                    return
-                }
-                
-                // 如果是工作模式下的握手包 (0x01)，直接进入传输期，解决首次消息延迟
-                if (value != null && value.size == 1 && value[0] == 0x01.toByte()) {
-                    if (responseNeeded) {
-                        @SuppressLint("MissingPermission")
-                        gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
-                    }
-                    stateListener?.invoke(ConnectionState.Transferring, null)
-                    @SuppressLint("MissingPermission")
-                    gattServer?.connect(device, false)
                     return
                 }
 
-                val macName = value?.let { String(it) } ?: "Unknown Mac"
+                // 单包写入：直接处理
+                if (value == null) return
                 if (responseNeeded) {
                     @SuppressLint("MissingPermission")
                     gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
                 }
-                //触发状态机的配对请求，等待UI确认或自动通过
-                stateListener?.invoke(ConnectionState.PairingRequest, macName)
+                processCharacteristicWrite(device, value)
             }
+        }
+
+        override fun onExecuteWrite(
+            device: BluetoothDevice?,
+            requestId: Int,
+            execute: Boolean
+        ) {
+            super.onExecuteWrite(device, requestId, execute)
+            if (device == null) return
+            
+            Log.i("BlePeripheral", "onExecuteWrite: execute=$execute")
+            
+            val buffer = writeBuffers[device.address]
+            if (execute && buffer != null) {
+                val fullValue = buffer.toByteArray()
+                processCharacteristicWrite(device, fullValue)
+            }
+            
+            writeBuffers.remove(device.address)
+            
+            @SuppressLint("MissingPermission")
+            gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
+        }
+
+        private fun processCharacteristicWrite(device: BluetoothDevice, value: ByteArray) {
+            val text = try { String(value) } catch (e: Exception) { null }
+            Log.i("BlePeripheral", "processCharacteristicWrite: length=${value.size}, textSnippet=${if (text != null && text.length > 20) text.take(20) else text}")
+            
+            if (text != null && text.startsWith("CLIP|")) {
+                onMessageReceived?.invoke(text)
+                return
+            }
+            
+            // 如果是工作模式下的握手包 (0x01)，直接进入传输期，解决首次消息延迟
+            if (value.size == 1 && value[0] == 0x01.toByte()) {
+                stateListener?.invoke(ConnectionState.Transferring, null)
+                @SuppressLint("MissingPermission")
+                gattServer?.connect(device, false)
+                return
+            }
+
+            val macName = text ?: "Unknown Mac"
+            //触发状态机的配对请求，等待UI确认或自动通过
+            stateListener?.invoke(ConnectionState.PairingRequest, macName)
         }
 
         override fun onDescriptorWriteRequest(
@@ -248,9 +287,21 @@ actual class BlePeripheral actual constructor() {
 
     @SuppressLint("MissingPermission")
     actual fun sendNotificationData(payload: ByteArray) {
-        val device = connectedDevice ?: return
-        val server = gattServer ?: return
-        val char = characteristic ?: return
+        val device = connectedDevice
+        if (device == null) {
+            Log.w("BlePeripheral", "sendNotificationData skipped: no connected device, payloadLength=${payload.size}")
+            return
+        }
+        val server = gattServer
+        if (server == null) {
+            Log.w("BlePeripheral", "sendNotificationData skipped: gattServer is null, payloadLength=${payload.size}")
+            return
+        }
+        val char = characteristic
+        if (char == null) {
+            Log.w("BlePeripheral", "sendNotificationData skipped: characteristic is null, payloadLength=${payload.size}")
+            return
+        }
 
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
             try {

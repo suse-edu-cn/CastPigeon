@@ -52,6 +52,10 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Smartphone
+import androidx.compose.material.icons.filled.Android
+import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CheckCircle
 
 // 底部导航项
 enum class AppTab(val title: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
@@ -542,56 +546,114 @@ fun SettingsContent() {
             Text("高级实验室", fontSize = 14.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
             Spacer(modifier = Modifier.height(8.dp))
             ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text("真·后台剪贴板", fontWeight = FontWeight.Bold)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            if (isPrivileged) {
-                                Icon(Icons.Default.Settings, contentDescription = null, tint = Color(0xFF4CAF50), modifier = Modifier.size(16.dp))
-                            }
-                        }
-                        Text(
-                            text = if (isPrivileged) "已获得最高权限，极致静默" else "点击开启纯静默剪贴板同步",
-                            fontSize = 12.sp,
-                            color = Color.Gray
-                        )
-                    }
-                    val bindStatus by com.suseoaa.castpigeon.service.PrivilegeManager.bindStatus.collectAsState()
-                    Switch(
-                        checked = isPrivileged,
-                        enabled = bindStatus != com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Binding,
-                        onCheckedChange = { checked ->
-                            if (checked && !isPrivileged) {
-                                val started = com.suseoaa.castpigeon.service.PrivilegeManager.executeAppOpsCommand(context)
-                                if (started) {
-                                    android.widget.Toast.makeText(context, "正在连接 Root 守护进程，请稍候（10s 内）…", android.widget.Toast.LENGTH_SHORT).show()
-                                } else {
-                                    android.widget.Toast.makeText(
-                                        context,
-                                        "Root 不可用！请在 KSU/APatch/Magisk 管理器中先授予本应用 Root 权限，然后重试",
-                                        android.widget.Toast.LENGTH_LONG
-                                    ).show()
+                Column(modifier = Modifier.padding(16.dp).fillMaxWidth()) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text("真·后台剪贴板", fontWeight = FontWeight.Bold)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                if (isPrivileged) {
+                                    Icon(
+                                        imageVector = Icons.Default.CheckCircle,
+                                        contentDescription = null,
+                                        tint = Color(0xFF4CAF50),
+                                        modifier = Modifier.size(16.dp)
+                                    )
                                 }
-                            } else if (!checked && isPrivileged) {
-                                com.suseoaa.castpigeon.service.PrivilegeManager.disable()
-                                android.widget.Toast.makeText(context, "已关闭真·静默模式", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                            val bindStatus by com.suseoaa.castpigeon.service.PrivilegeManager.bindStatus.collectAsState()
+                            val privilegeMode by com.suseoaa.castpigeon.service.PrivilegeManager.privilegeMode.collectAsState()
+                            
+                            val statusText = when (privilegeMode) {
+                                com.suseoaa.castpigeon.service.PrivilegeMode.DEFAULT -> "未开启后台提权同步"
+                                com.suseoaa.castpigeon.service.PrivilegeMode.ROOT -> {
+                                    when (bindStatus) {
+                                        com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Binding -> "正在获取 Root 权限…"
+                                        com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Connected -> "Root 提权已生效"
+                                        com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Failed -> "Root 授权失败"
+                                        else -> "已选择 Root 模式"
+                                    }
+                                }
+                                com.suseoaa.castpigeon.service.PrivilegeMode.SHIZUKU -> {
+                                    when (bindStatus) {
+                                        com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Binding -> "正在连接 Shizuku…"
+                                        com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Connected -> "Shizuku 提权已生效"
+                                        com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Failed -> "Shizuku 授权失败"
+                                        else -> "已选择 Shizuku 模式"
+                                    }
+                                }
+                            }
+                            Text(
+                                text = statusText,
+                                fontSize = 12.sp,
+                                color = if (isPrivileged) Color(0xFF4CAF50) else Color.Gray
+                            )
+                        }
+                    }
+                    
+                    Spacer(modifier = Modifier.height(12.dp))
+                    HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                    Spacer(modifier = Modifier.height(12.dp))
+                    
+                    // Segmented selection
+                    val privilegeMode by com.suseoaa.castpigeon.service.PrivilegeManager.privilegeMode.collectAsState()
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        val modes = listOf(
+                            Triple(com.suseoaa.castpigeon.service.PrivilegeMode.DEFAULT, "默认", Icons.Default.Close),
+                            Triple(com.suseoaa.castpigeon.service.PrivilegeMode.ROOT, "Root", Icons.Default.Android),
+                            Triple(com.suseoaa.castpigeon.service.PrivilegeMode.SHIZUKU, "Shizuku", Icons.Default.Build)
+                        )
+                        
+                        modes.forEach { (mode, label, icon) ->
+                            val selected = privilegeMode == mode
+                            OutlinedButton(
+                                onClick = {
+                                    if (mode == com.suseoaa.castpigeon.service.PrivilegeMode.DEFAULT) {
+                                        com.suseoaa.castpigeon.service.PrivilegeManager.disable()
+                                        android.widget.Toast.makeText(context, "已切换为默认模式", android.widget.Toast.LENGTH_SHORT).show()
+                                    } else if (mode == com.suseoaa.castpigeon.service.PrivilegeMode.ROOT) {
+                                        val started = com.suseoaa.castpigeon.service.PrivilegeManager.executeAppOpsCommand(context)
+                                        if (started) {
+                                            android.widget.Toast.makeText(context, "正在获取 Root 权限…", android.widget.Toast.LENGTH_SHORT).show()
+                                        }
+                                    } else if (mode == com.suseoaa.castpigeon.service.PrivilegeMode.SHIZUKU) {
+                                        if (!rikka.shizuku.Shizuku.pingBinder()) {
+                                            android.widget.Toast.makeText(context, "Shizuku 服务未运行！请先启动 Shizuku 应用程序", android.widget.Toast.LENGTH_LONG).show()
+                                        } else if (rikka.shizuku.Shizuku.checkSelfPermission() != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                            android.widget.Toast.makeText(context, "正在请求 Shizuku 授权，请在弹窗中允许…", android.widget.Toast.LENGTH_SHORT).show()
+                                            try {
+                                                rikka.shizuku.Shizuku.requestPermission(1001)
+                                            } catch (e: Exception) {
+                                                android.widget.Toast.makeText(context, "请求授权失败: ${e.message}", android.widget.Toast.LENGTH_SHORT).show()
+                                            }
+                                        } else {
+                                            com.suseoaa.castpigeon.service.PrivilegeManager.executeShizukuCommand(context)
+                                        }
+                                    }
+                                },
+                                modifier = Modifier.weight(1f),
+                                colors = if (selected) {
+                                    ButtonDefaults.outlinedButtonColors(
+                                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                                    )
+                                } else {
+                                    ButtonDefaults.outlinedButtonColors()
+                                },
+                                border = if (selected) {
+                                    null
+                                } else {
+                                    ButtonDefaults.outlinedButtonBorder
+                                },
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Icon(icon, contentDescription = null, modifier = Modifier.size(16.dp))
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(label, fontSize = 12.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+                                }
                             }
                         }
-                    )
-                    // 绑定状态提示文字
-                    if (bindStatus == com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Binding) {
-                        androidx.compose.material3.Text(
-                            "连接中…",
-                            fontSize = 10.sp,
-                            color = Color(0xFFFF9800)
-                        )
-                    } else if (bindStatus == com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Failed && !isPrivileged) {
-                        androidx.compose.material3.Text(
-                            "连接失败，请在管理器中授权",
-                            fontSize = 10.sp,
-                            color = Color(0xFFE53935)
-                        )
                     }
                 }
             }

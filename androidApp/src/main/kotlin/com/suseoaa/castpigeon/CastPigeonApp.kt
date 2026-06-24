@@ -11,5 +11,8 @@ class CastPigeonApp : Application() {
         
         // 初始化应用管理
         AppManager.init(this)
+
+        // 初始化特权管理器
+        com.suseoaa.castpigeon.service.PrivilegeManager.init(this)
     }
 }

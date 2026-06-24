@@ -21,22 +21,14 @@ class TransparentClipboardActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
-        // onResume 时 Activity 已经位于前台，可以读剪贴板
-        // 用 handled 防止 onWindowFocusChanged 重复触发
-        if (!handled) {
-            handled = true
-            Log.i("CastPigeon", "TransparentClipboardActivity onResume, action=${intent?.action}")
-            handleAction()
-            finish()
-            overridePendingTransition(0, 0)
-        }
+        Log.i("CastPigeon", "TransparentClipboardActivity onResume, action=${intent?.action}")
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        Log.i("CastPigeon", "TransparentClipboardActivity onWindowFocusChanged: hasFocus=$hasFocus, handled=$handled")
         if (hasFocus && !handled) {
             handled = true
-            Log.i("CastPigeon", "TransparentClipboardActivity onWindowFocusChanged hasFocus=true")
             handleAction()
             finish()
             overridePendingTransition(0, 0)
@@ -54,6 +46,7 @@ class TransparentClipboardActivity : Activity() {
                 // Mac → Android: 写入剪贴板
                 val textToSet = intent.getStringExtra("text")
                 if (textToSet != null) {
+                    com.suseoaa.castpigeon.service.BleForegroundService.isInternalClipboardWrite = true
                     val clip = ClipData.newPlainText("CastPigeon", textToSet)
                     clipboard.setPrimaryClip(clip)
                     Log.i("CastPigeon", "TransparentClipboardActivity: 写入剪贴板成功: $textToSet")

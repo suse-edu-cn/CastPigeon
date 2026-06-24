@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import android.util.Log
+import com.suseoaa.castpigeon.IClipboardChangeCallback
 import com.suseoaa.castpigeon.IRootClipboard
 import com.topjohnwu.superuser.ipc.RootService
 
@@ -84,17 +85,27 @@ class RootClipboardService : RootService() {
          * 写入剪贴板（Mac -> Android 方向）。
          * UID=0 的写入操作在许多 Android 版本中可以成功（写比读限制少）。
          */
-        override fun setClipboardText(text: String?) {
-            if (text == null) return
+        override fun setClipboardText(text: String?): Boolean {
+            if (text == null) return false
             Log.i("CastPigeonRoot", "setClipboardText: $text, myUID=${android.os.Process.myUid()}")
-            try {
+            return try {
                 val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 val clip = ClipData.newPlainText("CastPigeon", text)
                 clipboard.setPrimaryClip(clip)
                 Log.i("CastPigeonRoot", "setClipboardText success")
+                true
             } catch (e: Exception) {
                 Log.e("CastPigeonRoot", "setClipboardText failed", e)
+                false
             }
+        }
+
+        override fun registerClipboardCallback(callback: IClipboardChangeCallback?) {
+            Log.i("CastPigeonRoot", "registerClipboardCallback ignored for RootClipboardService")
+        }
+
+        override fun unregisterClipboardCallback(callback: IClipboardChangeCallback?) {
+            Log.i("CastPigeonRoot", "unregisterClipboardCallback ignored for RootClipboardService")
         }
     }
 }
