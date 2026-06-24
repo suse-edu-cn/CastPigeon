@@ -191,27 +191,28 @@ object PrivilegeManager {
                     return@launch
                 }
 
-                // 执行 appops 权限授予
+                Log.i("CastPigeonRoot", "Root 可用: out=${suTest.out}")
+
+                // AppOps 是普通进程读取兜底，不作为 Root 模式可用性的唯一判断。
                 val result = Shell.cmd("appops set com.suseoaa.castpigeon READ_CLIPBOARD allow").exec()
                 if (result.isSuccess) {
-                    Log.i("CastPigeonRoot", "Root AppOps 提权成功，开始绑定 RootClipboardService")
-                    privilegeMode.value = PrivilegeMode.ROOT
-                    prefs?.edit()?.putString("privilege_mode", PrivilegeMode.ROOT.name)?.apply()
-                    
-                    android.os.Handler(android.os.Looper.getMainLooper()).post {
-                        try {
-                            val intent = Intent(context, RootClipboardService::class.java)
-                            RootService.bind(intent, rootConnection)
-                        } catch (e: Exception) {
-                            Log.e("CastPigeonRoot", "绑定 RootClipboardService 失败", e)
-                            bindStatus.value = BindStatus.Failed
-                            isPrivileged.value = false
-                        }
-                    }
+                    Log.i("CastPigeonRoot", "Root AppOps 提权命令执行成功")
                 } else {
-                    Log.w("CastPigeonRoot", "Root AppOps 提权失败: ${result.err}")
-                    bindStatus.value = BindStatus.Failed
-                    isPrivileged.value = false
+                    Log.w("CastPigeonRoot", "Root AppOps 提权命令失败，继续绑定 RootClipboardService: ${result.err}")
+                }
+
+                privilegeMode.value = PrivilegeMode.ROOT
+                prefs?.edit()?.putString("privilege_mode", PrivilegeMode.ROOT.name)?.apply()
+
+                android.os.Handler(android.os.Looper.getMainLooper()).post {
+                    try {
+                        val intent = Intent(context, RootClipboardService::class.java)
+                        RootService.bind(intent, rootConnection)
+                    } catch (e: Exception) {
+                        Log.e("CastPigeonRoot", "绑定 RootClipboardService 失败", e)
+                        bindStatus.value = BindStatus.Failed
+                        isPrivileged.value = false
+                    }
                 }
             } catch (e: Exception) {
                 Log.e("CastPigeonRoot", "执行 Root 提权发生异常", e)
