@@ -1,25 +1,17 @@
-import re
-
 with open('/Users/vincent/Desktop/CastPigeon/androidApp/src/main/AndroidManifest.xml', 'r') as f:
     content = f.read()
 
 target = """        <activity
-            android:exported="true"
-            android:name=".MainActivity">"""
-
-new_target = """        <activity
-            android:name=".ui.TransparentClipboardActivity"
-            android:exported="false"
-            android:theme="@android:style/Theme.Translucent.NoTitleBar"
-            android:excludeFromRecents="true"
-            android:taskAffinity="" />
+            android:name=".ui.TransparentClipboardActivity\""""
+new_target = """        <service
+            android:name=".service.RootClipboardService"
+            android:exported="false" />
 
         <activity
-            android:exported="true"
-            android:name=".MainActivity">"""
+            android:name=".ui.TransparentClipboardActivity\""""
 
-if "TransparentClipboardActivity" not in content:
+if ".service.RootClipboardService" not in content:
     content = content.replace(target, new_target)
-    with open('/Users/vincent/Desktop/CastPigeon/androidApp/src/main/AndroidManifest.xml', 'w') as f:
-        f.write(content)
-    print("Patched AndroidManifest.xml")
+
+with open('/Users/vincent/Desktop/CastPigeon/androidApp/src/main/AndroidManifest.xml', 'w') as f:
+    f.write(content)

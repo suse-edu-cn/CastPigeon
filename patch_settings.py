@@ -1,7 +1,7 @@
-rootProject.name = "CastPigeon"
-enableFeaturePreview("TYPESAFE_PROJECT_ACCESSORS")
+with open('/Users/vincent/Desktop/CastPigeon/settings.gradle.kts', 'r') as f:
+    content = f.read()
 
-pluginManagement {
+target = """dependencyResolutionManagement {
     repositories {
         google {
             mavenContent {
@@ -11,11 +11,10 @@ pluginManagement {
             }
         }
         mavenCentral()
-        gradlePluginPortal()
     }
-}
+}"""
 
-dependencyResolutionManagement {
+new_target = """dependencyResolutionManagement {
     repositories {
         google {
             mavenContent {
@@ -27,8 +26,10 @@ dependencyResolutionManagement {
         mavenCentral()
         maven("https://jitpack.io")
     }
-}
+}"""
 
-include(":androidApp")
-include(":sharedLogic")
-include(":sharedUI")
+if 'maven("https://jitpack.io")' not in content:
+    content = content.replace(target, new_target)
+
+with open('/Users/vincent/Desktop/CastPigeon/settings.gradle.kts', 'w') as f:
+    f.write(content)

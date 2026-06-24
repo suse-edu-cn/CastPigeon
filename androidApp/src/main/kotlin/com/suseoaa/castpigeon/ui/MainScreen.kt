@@ -40,7 +40,12 @@ import kotlinx.serialization.encodeToString
 import com.suseoaa.castpigeon.service.AppConnectionManager
 import androidx.core.content.edit
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.HazeStyle
+import dev.chrisbanes.haze.HazeTint
+import dev.chrisbanes.haze.hazeEffect
 import dev.chrisbanes.haze.hazeSource
+
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.History
@@ -194,17 +199,13 @@ fun MainScreen(
         try {
             stateMachine.setRole(DeviceRole.valueOf(lastRoleStr))
         } catch (_: Exception) {}
-        
-        // 如果存在已绑定的设备，自动启动工作模式
+
+        // 每次启动都无条件检查并请求所有必需权限
+        // 首次安装或重装后权限被撤销时均会弹出权限申请对话框
         if (boundMacs.isNotEmpty()) {
-            val targetMode = WorkMode.Working
-            if (hasAllPermissions()) {
-                startBluetoothAction(stateMachine, blePeripheral, bleCentral, role, targetMode, deviceHash, boundMacs, myName)
-            } else {
-                pendingAction = targetMode
-                permissionLauncher.launch(permissionsToRequest)
-            }
+            pendingAction = WorkMode.Working
         }
+        permissionLauncher.launch(permissionsToRequest)
     }
 
     LaunchedEffect(role) {
@@ -321,26 +322,20 @@ fun MainScreen(
                 Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
                     when (tab) {
                         AppTab.Dashboard -> DashboardContent(
-                            stateMachine = stateMachine,
-                            blePeripheral = blePeripheral,
-                            bleCentral = bleCentral,
-                            role = role,
-                            workMode = workMode,
-                            connectionState = connectionState,
-                            boundMacs = boundMacs,
-                            prefs = prefs,
-                            myHashStr = myHashStr,
-                            receivedMockMessage = receivedMockMessage,
-                            connectedDeviceName = connectedDeviceName,
-                            onAction = { action ->
-                                if (hasAllPermissions()) {
-                                    startBluetoothAction(stateMachine, blePeripheral, bleCentral, role, action, deviceHash, boundMacs, myName)
-                                } else {
-                                    pendingAction = action
-                                    permissionLauncher.launch(permissionsToRequest)
-                                }
-                            }
-                        )
+                    stateMachine = stateMachine,
+                    blePeripheral = blePeripheral,
+                    bleCentral = bleCentral,
+                    connectionState = connectionState,
+                    role = role,
+                    workMode = workMode,
+                    pairingDeviceName = pairingDeviceName,
+                    connectedDeviceName = connectedDeviceName,
+                    deviceHash = deviceHash,
+                    boundMacs = boundMacs,
+                    myName = myName,
+                    prefs = prefs,
+                    hazeState = hazeState
+                )
                         AppTab.History -> HistoryScreen()
                         AppTab.Settings -> SettingsContent()
                     }
@@ -355,72 +350,112 @@ fun DashboardContent(
     stateMachine: ConnectionStateMachine,
     blePeripheral: BlePeripheral,
     bleCentral: BleCentral,
+    connectionState: ConnectionState,
     role: DeviceRole,
     workMode: WorkMode,
-    connectionState: ConnectionState,
-    boundMacs: MutableList<String>,
-    prefs: android.content.SharedPreferences,
-    myHashStr: String,
-    receivedMockMessage: String?,
+    pairingDeviceName: String?,
     connectedDeviceName: String?,
-    onAction: (WorkMode) -> Unit
+    deviceHash: ByteArray,
+    boundMacs: MutableList<String>,
+    myName: String,
+    prefs: android.content.SharedPreferences,
+    hazeState: dev.chrisbanes.haze.HazeState
 ) {
-    val context = LocalContext.current as android.content.Context
-    val isNotificationListenerEnabled = remember(workMode, role) { 
-        NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName) 
-    }
-
-    val animatedStatusColor by animateColorAsState(
-        targetValue = when (connectionState) {
-            ConnectionState.Idle -> Color(0xFF888888)
-            ConnectionState.AdvertisingOrScanning -> Color(0xFF007AFF)
-            ConnectionState.Connecting -> Color(0xFFFFA500)
-            ConnectionState.Transferring -> Color(0xFF34C759)
-            ConnectionState.Disconnecting -> Color(0xFFFF3B30)
-            ConnectionState.PairingRequest -> Color(0xFFFFCC00)
-        },
-        animationSpec = spring(stiffness = Spring.StiffnessLow), label = "statusColor"
+    val receivedMockMessage by AppConnectionManager.lastReceivedMessage.collectAsState()
+    val isSystemDark = androidx.compose.foundation.isSystemInDarkTheme()
+    
+    val infiniteTransition = rememberInfiniteTransition(label = "breathing")
+    val alpha by infiniteTransition.animateFloat(
+        initialValue = 0.4f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "breathingAlpha"
     )
 
+    val statusColor = when (connectionState) {
+        ConnectionState.Idle -> Color.Gray
+        ConnectionState.Transferring -> Color(0xFF4CAF50)
+        else -> Color(0xFFFFC107)
+    }
+
     Column(
-        modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(16.dp)
+            .padding(top = 48.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Spacer(modifier = Modifier.height(24.dp))
-        Text("CastPigeon", fontSize = 28.sp, fontWeight = FontWeight.Bold)
-        Text("近场通知同步", fontSize = 14.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // 状态卡片
-        ElevatedCard(
-            modifier = Modifier.fillMaxWidth().height(180.dp),
-            colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface),
-            elevation = CardDefaults.elevatedCardElevation(defaultElevation = 8.dp)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(24.dp))
+                .hazeEffect(
+                    state = hazeState,
+                    style = HazeStyle(backgroundColor = if (isSystemDark) androidx.compose.ui.graphics.Color.White.copy(alpha = 0.05f) else androidx.compose.ui.graphics.Color.White.copy(alpha = 0.6f), tint = dev.chrisbanes.haze.HazeTint(androidx.compose.ui.graphics.Color.White.copy(alpha = 0.1f)), blurRadius = 30.dp)
+                )
+                .background(if (isSystemDark) Color.White.copy(alpha = 0.05f) else Color.White.copy(alpha = 0.3f))
+                .padding(24.dp)
         ) {
-            Box(
-                modifier = Modifier.fillMaxSize().background(Brush.linearGradient(
-                    listOf(animatedStatusColor.copy(alpha = 0.2f), MaterialTheme.colorScheme.surface)
-                )),
-                contentAlignment = Alignment.Center
-            ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                    val infiniteTransition = rememberInfiniteTransition(label = "pulse")
-                    val scale by infiniteTransition.animateFloat(
-                        initialValue = 1f, targetValue = if (workMode != WorkMode.Idle) 1.2f else 1f,
-                        animationSpec = infiniteRepeatable(animation = tween(1000), repeatMode = RepeatMode.Reverse), label = "pulse"
+            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .clip(androidx.compose.foundation.shape.CircleShape)
+                            .background(statusColor.copy(alpha = alpha))
                     )
-                    Box(modifier = Modifier.size(56.dp).scale(scale).clip(RoundedCornerShape(28.dp)).background(animatedStatusColor))
-                    
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = if (workMode == WorkMode.Idle) "已准备就绪" else "${workMode.name} : ${connectionState.name}",
-                        fontSize = 20.sp, fontWeight = FontWeight.SemiBold
+                        text = when (connectionState) {
+                            ConnectionState.Idle -> "系统待机中"
+                            ConnectionState.AdvertisingOrScanning -> if (role == DeviceRole.Sender) "等待 Mac 连接" else "寻找 Mac 中"
+                            ConnectionState.Connecting -> "正在建立加密通道"
+                            ConnectionState.Transferring -> "已连接 Mac - 静默监控中"
+                            else -> "未知状态"
+                        },
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp,
+                        color = MaterialTheme.colorScheme.onSurface
                     )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "设备ID: $myHashStr",
-                        fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                }
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                val switchColors = SwitchDefaults.colors(
+                    checkedThumbColor = MaterialTheme.colorScheme.primary,
+                    checkedTrackColor = Color.White,
+                    uncheckedThumbColor = Color.Gray,
+                    uncheckedTrackColor = Color.White.copy(alpha = 0.8f),
+                    uncheckedBorderColor = Color.Transparent,
+                    checkedBorderColor = Color.Transparent
+                )
+
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.Center, modifier = Modifier.fillMaxWidth()) {
+                    Text("服务状态", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Switch(
+                        checked = workMode != WorkMode.Idle,
+                        onCheckedChange = { checked ->
+                            if (checked) {
+                                if (boundMacs.isEmpty()) {
+                                    startBluetoothAction(stateMachine, blePeripheral, bleCentral, role, WorkMode.Pairing, deviceHash, boundMacs, myName)
+                                } else {
+                                    startBluetoothAction(stateMachine, blePeripheral, bleCentral, role, WorkMode.Working, deviceHash, boundMacs, myName)
+                                }
+                            } else {
+                                UdpDiscovery.stop()
+                                blePeripheral.stopAdvertising()
+                                blePeripheral.disconnectCurrentDevice()
+                                bleCentral.stopScanning()
+                                bleCentral.disconnect()
+                                stateMachine.setWorkMode(WorkMode.Idle)
+                                val ctx = com.suseoaa.castpigeon.shared.BleContextHolder.applicationContext
+                                if (ctx != null) com.suseoaa.castpigeon.service.BleForegroundService.stop(ctx)
+                            }
+                        },
+                        colors = switchColors
                     )
                 }
             }
@@ -428,253 +463,63 @@ fun DashboardContent(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        if (workMode == WorkMode.Idle) {
-            // 角色选择
-            Row(
-                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)).padding(4.dp),
-                horizontalArrangement = Arrangement.Center
-            ) {
-                DeviceRole.entries.forEach { r ->
-                    val isSelected = role == r
-                    Box(
-                        modifier = Modifier.weight(1f).clip(RoundedCornerShape(12.dp)).background(if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent).padding(vertical = 12.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        TextButton(
-                            onClick = { stateMachine.setRole(r) },
-                            enabled = true
+        if (workMode == WorkMode.Pairing) {
+            val udpDevices by UdpDiscovery.discoveredDevices.collectAsState()
+            Text("在线设备", fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.Start))
+            Spacer(modifier = Modifier.height(8.dp))
+            if (udpDevices.isNotEmpty()) {
+                LazyColumn {
+                    items(udpDevices.toList()) { device ->
+                        ElevatedCard(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            onClick = {
+                                UdpDiscovery.requestBinding(device.hash, device.deviceName, role.name, device.ipAddress)
+                            }
                         ) {
-                            Text(
-                                text = if (r == DeviceRole.Sender) "作为发送端" else "作为接收端",
-                                color = if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
-                                fontWeight = FontWeight.Bold
-                            )
+                            Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                                Column {
+                                    Text(device.deviceName, fontWeight = FontWeight.Bold)
+                                    Text("IP: ${device.ipAddress}", fontSize = 12.sp, color = Color.Gray)
+                                }
+                                Icon(Icons.Default.Computer, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                            }
                         }
                     }
                 }
+            } else {
+                Box(modifier = Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator()
+                }
             }
-            Spacer(modifier = Modifier.height(24.dp))
-            
-            if (role == DeviceRole.Sender && !isNotificationListenerEnabled) {
-                ElevatedCard(
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp),
-                    colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.errorContainer)
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("需要通知读取权限", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onErrorContainer)
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text("作为发送端，必须允许读取通知才能将消息同步给 macOS。", fontSize = 12.sp, color = MaterialTheme.colorScheme.onErrorContainer)
-                        Spacer(modifier = Modifier.height(8.dp))
+        } else if (connectionState == ConnectionState.Transferring) {
+            ElevatedCard(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
+                    if (role == DeviceRole.Sender) {
                         Button(
                             onClick = {
-                                val intent = Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
-                                context.startActivity(intent)
-                            },
-                            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                        ) {
-                            Text("去设置中开启")
-                        }
-                    }
-                }
-            }
-
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-                Button(
-                    onClick = { onAction(WorkMode.Pairing) },
-                    modifier = Modifier.weight(1f).height(56.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.secondaryContainer, contentColor = MaterialTheme.colorScheme.onSecondaryContainer)
-                ) {
-                    Text("配对新设备")
-                }
-                Button(
-                    onClick = { onAction(WorkMode.Working) },
-                    modifier = Modifier.weight(1f).height(56.dp)
-                ) {
-                    Text("启动工作")
-                }
-            }
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            if (boundMacs.isNotEmpty()) {
-                Column(modifier = Modifier.fillMaxWidth()) {
-                    Text("已绑定的设备", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                    Spacer(modifier = Modifier.height(8.dp))
-                    var editingMac by remember { mutableStateOf<String?>(null) }
-                    var newDeviceName by remember { mutableStateOf("") }
-                    
-                    if (editingMac != null) {
-                        AlertDialog(
-                            onDismissRequest = { editingMac = null },
-                            title = { Text("重命名设备") },
-                            text = {
-                                OutlinedTextField(
-                                    value = newDeviceName,
-                                    onValueChange = { newDeviceName = it },
-                                    singleLine = true,
-                                    label = { Text("设备名称") }
-                                )
-                            },
-                            confirmButton = {
-                                Button(onClick = {
-                                    val oldMac = editingMac!!
-                                    val hash = oldMac.substringAfter("|", "")
-                                    if (newDeviceName.isNotBlank() && hash.isNotBlank()) {
-                                        val newMac = "$newDeviceName|$hash"
-                                        val newSet = boundMacs.toSet() - oldMac + newMac
-                                        prefs.edit { putStringSet("BoundMacs", newSet) }
-                                        boundMacs.remove(oldMac)
-                                        boundMacs.add(newMac)
-                                    }
-                                    editingMac = null
-                                }) { Text("保存") }
-                            },
-                            dismissButton = {
-                                TextButton(onClick = { editingMac = null }) { Text("取消") }
-                            }
-                        )
-                    }
-
-                    LazyColumn {
-                        items(boundMacs) { mac ->
-                            ElevatedCard(
-                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                                colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    val parts = mac.split("|")
-                                    val name = if (parts.isNotEmpty()) parts[0] else "未知设备"
-                                    val hash = if (parts.size > 1) parts[1] else "Unknown"
-                                    val isOnline = (connectionState == ConnectionState.Transferring && connectedDeviceName == name)
-
-                                    Row(verticalAlignment = Alignment.CenterVertically) {
-                                        Icon(Icons.Default.Computer, contentDescription = "Mac", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(24.dp))
-                                        Spacer(modifier = Modifier.width(12.dp))
-                                        Column {
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Text(name, fontWeight = FontWeight.SemiBold)
-                                                Spacer(modifier = Modifier.width(6.dp))
-                                                Box(modifier = Modifier.size(8.dp).background(if (isOnline) Color.Green else Color.Gray, shape = RoundedCornerShape(4.dp)))
-                                            }
-                                            Text("Hash: $hash", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                        }
-                                    }
-                                    
-                                    Row {
-                                        TextButton(onClick = {
-                                            editingMac = mac
-                                            newDeviceName = name
-                                        }) { Text("重命名") }
-                                        
-                                        TextButton(onClick = {
-                                            val newSet = boundMacs.toSet() - mac
-                                            prefs.edit { putStringSet("BoundMacs", newSet) }
-                                            boundMacs.remove(mac)
-                                        }) { Text("解绑", color = MaterialTheme.colorScheme.error) }
-                                    }
+                                try {
+                                    val notif = com.suseoaa.castpigeon.shared.NotificationMessage(
+                                        id = "test_${System.currentTimeMillis()}",
+                                        appName = "CastPigeon Test",
+                                        title = "测试通知",
+                                        content = "模拟消息：${Date()}",
+                                        timestamp = System.currentTimeMillis()
+                                    )
+                                    val jsonStr = kotlinx.serialization.json.Json.encodeToString(notif)
+                                    blePeripheral.sendNotificationData(jsonStr.encodeToByteArray())
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
                                 }
-                            }
-                        }
-                    }
-                }
-            }
-        } else {
-            Button(
-                onClick = {
-                    UdpDiscovery.stop()
-                    blePeripheral.stopAdvertising()
-                    blePeripheral.disconnectCurrentDevice()
-                    bleCentral.stopScanning()
-                    bleCentral.disconnect()
-                    stateMachine.setWorkMode(WorkMode.Idle)
-                    
-                    val ctx = com.suseoaa.castpigeon.shared.BleContextHolder.applicationContext
-                    if (ctx != null) {
-                        com.suseoaa.castpigeon.service.BleForegroundService.stop(ctx)
-                    }
-                },
-                modifier = Modifier.fillMaxWidth().height(56.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-            ) {
-                Text("停止并断开", fontWeight = FontWeight.Bold)
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            if (workMode == WorkMode.Pairing) {
-                val udpDevices by UdpDiscovery.discoveredDevices.collectAsState()
-                if (udpDevices.isNotEmpty()) {
-                    Column(modifier = Modifier.fillMaxWidth().weight(1f)) {
-                        Text("发现的设备：", fontWeight = FontWeight.Bold)
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) { Text("发送测试通知") }
+                    } else {
+                        Text("最新收到消息：", fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(8.dp))
-                        LazyColumn {
-                            items(udpDevices.toList()) { device ->
-                                ElevatedCard(
-                                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                                    onClick = {
-                                        UdpDiscovery.requestBinding(
-                                            targetHash = device.hash,
-                                            targetDeviceName = device.deviceName,
-                                            targetRole = role.name,
-                                            targetIp = device.ipAddress
-                                        )
-                                    }
-                                ) {
-                                    Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                        Column {
-                                            Text(device.deviceName, fontWeight = FontWeight.Bold)
-                                            Text("Role: ${device.role}", fontSize = 12.sp)
-                                        }
-                                        Button(onClick = { /* 拦截点击给Card处理 */ }, modifier = Modifier.scale(0.9f)) { Text("绑定") }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    Box(modifier = Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator()
-                    }
-                }
-            }
-
-            if (connectionState == ConnectionState.Transferring) {
-                ElevatedCard(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp),
-                    colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
-                ) {
-                    Column(modifier = Modifier.padding(16.dp).fillMaxWidth()) {
-                        if (role == DeviceRole.Sender) {
-                            Button(
-                                onClick = {
-                                    try {
-                                        val notif = com.suseoaa.castpigeon.shared.NotificationMessage(
-                                            id = "test_${System.currentTimeMillis()}",
-                                            appName = "CastPigeon Test",
-                                            title = "测试通知",
-                                            content = "这是一条来自 Android 的模拟测试通知：${Date()}",
-                                            timestamp = System.currentTimeMillis()
-                                        )
-                                        val jsonStr = kotlinx.serialization.json.Json.encodeToString(notif)
-                                        blePeripheral.sendNotificationData(jsonStr.encodeToByteArray())
-                                    } catch (e: Exception) {
-                                        e.printStackTrace()
-                                    }
-                                },
-                                modifier = Modifier.fillMaxWidth()
-                            ) { Text("发送测试通知") }
-                        } else {
-                            Text("最新收到消息：", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = receivedMockMessage ?: "暂无",
-                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
-                            )
-                        }
+                        Text(text = receivedMockMessage ?: "暂无")
                     }
                 }
             }
@@ -685,14 +530,80 @@ fun DashboardContent(
 @Composable
 fun SettingsContent() {
     val apps by AppManager.appList.collectAsState()
+    val context = LocalContext.current
+    val isPrivileged by com.suseoaa.castpigeon.service.PrivilegeManager.isPrivileged.collectAsState()
     
     Column(modifier = Modifier.fillMaxSize()) {
         Box(modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(horizontal = 24.dp, vertical = 16.dp)) {
-            Text("应用同步设置", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+            Text("控制台", fontSize = 24.sp, fontWeight = FontWeight.Bold)
         }
+        
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 8.dp)) {
+            Text("高级实验室", fontSize = 14.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(8.dp))
+            ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+                Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("真·后台剪贴板", fontWeight = FontWeight.Bold)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            if (isPrivileged) {
+                                Icon(Icons.Default.Settings, contentDescription = null, tint = Color(0xFF4CAF50), modifier = Modifier.size(16.dp))
+                            }
+                        }
+                        Text(
+                            text = if (isPrivileged) "已获得最高权限，极致静默" else "点击开启纯静默剪贴板同步",
+                            fontSize = 12.sp,
+                            color = Color.Gray
+                        )
+                    }
+                    val bindStatus by com.suseoaa.castpigeon.service.PrivilegeManager.bindStatus.collectAsState()
+                    Switch(
+                        checked = isPrivileged,
+                        enabled = bindStatus != com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Binding,
+                        onCheckedChange = { checked ->
+                            if (checked && !isPrivileged) {
+                                val started = com.suseoaa.castpigeon.service.PrivilegeManager.executeAppOpsCommand(context)
+                                if (started) {
+                                    android.widget.Toast.makeText(context, "正在连接 Root 守护进程，请稍候（10s 内）…", android.widget.Toast.LENGTH_SHORT).show()
+                                } else {
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "Root 不可用！请在 KSU/APatch/Magisk 管理器中先授予本应用 Root 权限，然后重试",
+                                        android.widget.Toast.LENGTH_LONG
+                                    ).show()
+                                }
+                            } else if (!checked && isPrivileged) {
+                                com.suseoaa.castpigeon.service.PrivilegeManager.disable()
+                                android.widget.Toast.makeText(context, "已关闭真·静默模式", android.widget.Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    )
+                    // 绑定状态提示文字
+                    if (bindStatus == com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Binding) {
+                        androidx.compose.material3.Text(
+                            "连接中…",
+                            fontSize = 10.sp,
+                            color = Color(0xFFFF9800)
+                        )
+                    } else if (bindStatus == com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Failed && !isPrivileged) {
+                        androidx.compose.material3.Text(
+                            "连接失败，请在管理器中授权",
+                            fontSize = 10.sp,
+                            color = Color(0xFFE53935)
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+        Text("应用同步设置", fontSize = 14.sp, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 24.dp))
+        Spacer(modifier = Modifier.height(8.dp))
+        
         HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
         if (apps.isEmpty()) {
-            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Box(modifier = Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator()
             }
         } else {
@@ -749,16 +660,37 @@ private fun startBluetoothAction(
         }
         
         if (role == DeviceRole.Sender) {
-            blePeripheral.startAdvertising(mode, deviceHash) { newState, name ->
-                stateMachine.transitionTo(newState, name)
+            try {
+                blePeripheral.startAdvertising(mode, deviceHash) { newState, name ->
+                    stateMachine.transitionTo(newState, name)
+                }
+            } catch (e: SecurityException) {
+                android.util.Log.e("CastPigeonUI", "蓝牙权限不足，无法开始广播: ${e.message}")
+                stateMachine.transitionTo(ConnectionState.Idle)
+                android.widget.Toast.makeText(
+                    context,
+                    "蓝牙权限不足，请在系统设置中授予权限后重试",
+                    android.widget.Toast.LENGTH_LONG
+                ).show()
+            } catch (e: Exception) {
+                android.util.Log.e("CastPigeonUI", "startAdvertising 失败", e)
+                stateMachine.transitionTo(ConnectionState.Idle)
             }
         } else {
-            val targetHashes = boundMacs.mapNotNull { 
-                val hashStr = it.substringAfter("|", "")
-                if (hashStr.isNotEmpty()) hashStr.chunked(2).map { hex -> hex.toInt(16).toByte() }.toByteArray() else null
-            }.toSet()
-            bleCentral.startScanning(mode, targetHashes) { newState, name ->
-                stateMachine.transitionTo(newState, name)
+            try {
+                val targetHashes = boundMacs.mapNotNull { 
+                    val hashStr = it.substringAfter("|", "")
+                    if (hashStr.isNotEmpty()) hashStr.chunked(2).map { hex -> hex.toInt(16).toByte() }.toByteArray() else null
+                }.toSet()
+                bleCentral.startScanning(mode, targetHashes) { newState, name ->
+                    stateMachine.transitionTo(newState, name)
+                }
+            } catch (e: SecurityException) {
+                android.util.Log.e("CastPigeonUI", "蓝牙权限不足，无法开始扫描: ${e.message}")
+                stateMachine.transitionTo(ConnectionState.Idle)
+            } catch (e: Exception) {
+                android.util.Log.e("CastPigeonUI", "startScanning 失败", e)
+                stateMachine.transitionTo(ConnectionState.Idle)
             }
         }
     }

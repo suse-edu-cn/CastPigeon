@@ -1,43 +1,94 @@
 package com.suseoaa.castpigeon.ui
 
 import android.app.Activity
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.os.Bundle
+import android.util.Log
 import android.widget.Toast
 import com.suseoaa.castpigeon.service.AppConnectionManager
 
 class TransparentClipboardActivity : Activity() {
+
+    private var handled = false
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // 确保 Activity 不会闪现出默认的黑色/白色背景
         window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.TRANSPARENT))
+        Log.i("CastPigeon", "TransparentClipboardActivity onCreate, action=${intent?.action}")
     }
 
-    override fun onWindowFocusChanged(hasFocus: Boolean) {
-        super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) {
-            readClipboardAndSend()
+    override fun onResume() {
+        super.onResume()
+        // onResume 时 Activity 已经位于前台，可以读剪贴板
+        // 用 handled 防止 onWindowFocusChanged 重复触发
+        if (!handled) {
+            handled = true
+            Log.i("CastPigeon", "TransparentClipboardActivity onResume, action=${intent?.action}")
+            handleAction()
             finish()
-            // 禁用退出动画
             overridePendingTransition(0, 0)
         }
     }
 
-    private fun readClipboardAndSend() {
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && !handled) {
+            handled = true
+            Log.i("CastPigeon", "TransparentClipboardActivity onWindowFocusChanged hasFocus=true")
+            handleAction()
+            finish()
+            overridePendingTransition(0, 0)
+        }
+    }
+
+    private fun handleAction() {
+        val action = intent?.action
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        val text = clipboard.primaryClip?.getItemAt(0)?.text?.toString()
-        if (!text.isNullOrEmpty()) {
-            val payload = "CLIP|" + text
-            try {
-                AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
-                Toast.makeText(this, "已推送到 Mac", Toast.LENGTH_SHORT).show()
-            } catch (e: Exception) {
-                e.printStackTrace()
-                Toast.makeText(this, "推送失败", Toast.LENGTH_SHORT).show()
+
+        Log.i("CastPigeon", "TransparentClipboardActivity handleAction: action=$action")
+
+        when (action) {
+            "ACTION_SET_CLIPBOARD" -> {
+                // Mac → Android: 写入剪贴板
+                val textToSet = intent.getStringExtra("text")
+                if (textToSet != null) {
+                    val clip = ClipData.newPlainText("CastPigeon", textToSet)
+                    clipboard.setPrimaryClip(clip)
+                    Log.i("CastPigeon", "TransparentClipboardActivity: 写入剪贴板成功: $textToSet")
+                    Toast.makeText(this, "已同步 Mac 剪贴板", Toast.LENGTH_SHORT).show()
+                }
             }
-        } else {
-            Toast.makeText(this, "剪贴板为空或无法访问", Toast.LENGTH_SHORT).show()
+            else -> {
+                // Android → Mac: 读取剪贴板并通过 BLE 发送
+                // action 可能是 ACTION_SYNC_CLIPBOARD（手动）或 ACTION_SYNC_CLIPBOARD_AUTO（Root 自动触发）
+                Log.i("CastPigeon", "TransparentClipboardActivity: 读取剪贴板...")
+                val clip = clipboard.primaryClip
+                Log.i("CastPigeon", "TransparentClipboardActivity: primaryClip=$clip, itemCount=${clip?.itemCount ?: 0}")
+                val text = clip?.getItemAt(0)?.text?.toString()
+                Log.i("CastPigeon", "TransparentClipboardActivity: 读取结果: '$text'")
+
+                if (!text.isNullOrEmpty()) {
+                    val payload = "CLIP|$text"
+                    try {
+                        AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
+                        Log.i("CastPigeon", "TransparentClipboardActivity: BLE 发送成功! payload长度=${payload.length}")
+                        // 仅手动触发时显示 Toast
+                        if (action == "ACTION_SYNC_CLIPBOARD") {
+                            Toast.makeText(this, "已推送到 Mac", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        Log.e("CastPigeon", "TransparentClipboardActivity: BLE 发送失败", e)
+                        Toast.makeText(this, "推送失败: ${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    Log.w("CastPigeon", "TransparentClipboardActivity: 剪贴板为空")
+                    if (action == "ACTION_SYNC_CLIPBOARD") {
+                        Toast.makeText(this, "剪贴板为空", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
         }
     }
 }

@@ -13,6 +13,7 @@ kotlin {
     }
 }
 dependencies {
+    implementation("dev.rikka.shizuku:api:13.1.5")
     implementation(projects.sharedLogic)
     implementation(projects.sharedUI)
 
@@ -23,6 +24,8 @@ dependencies {
     implementation(libs.compose.runtime)
     implementation(libs.compose.foundation)
     implementation(libs.compose.material3)
+    implementation("com.github.topjohnwu.libsu:core:6.0.0")
+    implementation("com.github.topjohnwu.libsu:service:6.0.0")
     implementation(libs.compose.ui)
     implementation(libs.compose.uiToolingPreview)
     debugImplementation(libs.compose.uiTooling)
@@ -39,6 +42,10 @@ dependencies {
 android {
     namespace = "com.suseoaa.castpigeon"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
+
+    buildFeatures {
+        aidl = true
+    }
 
     defaultConfig {
         applicationId = "com.suseoaa.castpigeon"

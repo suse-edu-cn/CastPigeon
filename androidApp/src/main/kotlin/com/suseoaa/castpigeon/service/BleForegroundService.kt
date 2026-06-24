@@ -24,6 +24,7 @@ import android.content.BroadcastReceiver
 import android.content.IntentFilter
 import android.content.ClipboardManager
 import android.content.ClipData
+import android.content.ClipboardManager.OnPrimaryClipChangedListener
 import android.widget.Toast
 
 class BleForegroundService : Service() {
@@ -46,12 +47,73 @@ class BleForegroundService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
     private lateinit var dbHelper: MessageDatabaseHelper
     private var isObserving = false
+    private var lastSyncedText: String? = null
+    private var lastListenerTriggerTime = 0L
+
+    private val clipboardListener = OnPrimaryClipChangedListener {
+        val now = System.currentTimeMillis()
+        // 防抖：600ms 内不重复触发
+        if (now - lastListenerTriggerTime < 600) return@OnPrimaryClipChangedListener
+        lastListenerTriggerTime = now
+
+        android.util.Log.i("CastPigeon", "触发 OnPrimaryClipChangedListener! isPrivileged=${PrivilegeManager.isPrivileged.value}")
+
+        // Android 13+ 即使有 AppOps，有时第一次读取会慢一拍，所以稍微延时或者直接读
+        tryDirectClipboardRead()
+    }
+
+    private fun tryDirectClipboardRead() {
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val text = try {
+            clipboard.primaryClip?.getItemAt(0)?.text?.toString()
+        } catch (e: Exception) { null }
+
+        if (!text.isNullOrEmpty() && text != lastSyncedText) {
+            lastSyncedText = text
+            val payload = "CLIP|$text"
+            android.util.Log.i("CastPigeon", "读取剪贴板成功，发送: $payload")
+            try {
+                AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
+                android.util.Log.i("CastPigeon", "发送到 Mac 成功！")
+            } catch (e: Exception) {
+                android.util.Log.e("CastPigeon", "发送失败", e)
+            }
+        } else {
+            if (PrivilegeManager.isPrivileged.value) {
+                android.util.Log.w("CastPigeon", "已开启高级提权，但仍读取为空。这可能是系统延迟导致，请再试一次。")
+            } else {
+                android.util.Log.w("CastPigeon", "读取为空（可能被系统拦截）。请在设置中开启 Root 高级提权。")
+            }
+        }
+    }
 
     private val clipboardSyncReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
+            android.util.Log.i("CastPigeon", "收到广播: ${intent?.action}")
+            if (intent?.action == "com.suseoaa.castpigeon.ROOT_CLIPBOARD_CHANGED") {
+                val text = intent.getStringExtra("text")
+                if (!text.isNullOrEmpty() && text != lastSyncedText) {
+                    lastSyncedText = text
+                    val payload = "CLIP|$text"
+                    android.util.Log.i("CastPigeon", "收到 Root 守护进程剪贴板更新，准备发送: $payload")
+                    try {
+                        AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
+                        android.util.Log.i("CastPigeon", "自动发送剪贴板到 Mac 成功！")
+                    } catch (e: Exception) {
+                        android.util.Log.e("CastPigeon", "自动发送剪贴板失败", e)
+                    }
+                }
+                return
+            }
+
             if (intent?.action == "com.suseoaa.castpigeon.ACTION_SYNC_CLIPBOARD") {
+                android.util.Log.i("CastPigeon", "准备读取剪贴板并发送")
+
                 val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                val text = clipboard.primaryClip?.getItemAt(0)?.text?.toString()
+                val text = try {
+                    clipboard.primaryClip?.getItemAt(0)?.text?.toString()
+                } catch (e: Exception) { null }
+
                 if (!text.isNullOrEmpty()) {
                     val payload = "CLIP|$text"
                     try {
@@ -61,7 +123,11 @@ class BleForegroundService : Service() {
                         e.printStackTrace()
                     }
                 } else {
-                    Toast.makeText(this@BleForegroundService, "剪贴板为空或无法访问", Toast.LENGTH_SHORT).show()
+                    // Fallback to Transparent Activity
+                    val fallbackIntent = Intent(this@BleForegroundService, com.suseoaa.castpigeon.ui.TransparentClipboardActivity::class.java).apply {
+                        flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                    }
+                    startActivity(fallbackIntent)
                 }
             } else if (intent?.action == "com.suseoaa.castpigeon.ACTION_COPY_CLIPBOARD") {
                 val text = intent.getStringExtra("EXTRA_TEXT") ?: return
@@ -82,7 +148,9 @@ class BleForegroundService : Service() {
         createNotificationChannel()
         
         val filter = IntentFilter().apply {
+            addAction("com.suseoaa.castpigeon.ACTION_SYNC_CLIPBOARD")
             addAction("com.suseoaa.castpigeon.ACTION_COPY_CLIPBOARD")
+            addAction("com.suseoaa.castpigeon.ROOT_CLIPBOARD_CHANGED")
         }
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(clipboardSyncReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -95,6 +163,14 @@ class BleForegroundService : Service() {
             startForeground(NOTIFICATION_ID, buildNotification(dbHelper.getTodayMessageCount()))
         }
         startObservingNotifications()
+        
+        try {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.addPrimaryClipChangedListener(clipboardListener)
+            android.util.Log.i("CastPigeon", "已注册后台剪贴板监听器")
+        } catch (e: Exception) {
+            android.util.Log.e("CastPigeon", "注册剪贴板监听器失败", e)
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -108,6 +184,10 @@ class BleForegroundService : Service() {
         isObserving = false
         try {
             unregisterReceiver(clipboardSyncReceiver)
+        } catch (e: Exception) { }
+        try {
+            val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            clipboard.removePrimaryClipChangedListener(clipboardListener)
         } catch (e: Exception) { }
     }
 
@@ -145,6 +225,7 @@ class BleForegroundService : Service() {
         val handleMessage: (String) -> Unit = { msg ->
             if (msg.startsWith("CLIP|")) {
                 val text = msg.substring(5)
+                lastSyncedText = text // 防止回环触发
                 val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 try {
                     val clip = ClipData.newPlainText("CastPigeon", text)
@@ -220,10 +301,10 @@ class BleForegroundService : Service() {
     }
 
     private fun buildNotification(count: Int): Notification {
-        val syncIntent = Intent(this, com.suseoaa.castpigeon.ui.TransparentClipboardActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+        val syncIntent = Intent("com.suseoaa.castpigeon.ACTION_SYNC_CLIPBOARD").apply {
+            setPackage(packageName)
         }
-        val syncPendingIntent = android.app.PendingIntent.getActivity(
+        val syncPendingIntent = android.app.PendingIntent.getBroadcast(
             this, 0, syncIntent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
         )
         
