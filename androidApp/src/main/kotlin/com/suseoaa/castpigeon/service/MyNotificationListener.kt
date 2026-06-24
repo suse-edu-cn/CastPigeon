@@ -13,18 +13,30 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.Drawable
 import android.util.Base64
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.scale
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 
 class MyNotificationListener : NotificationListenerService() {
 
     companion object {
-        private const val TAG = "NotiLinker"
+        private const val TAG = "NotificationLinker"
     }
 
+    // 引入该服务独立的协程生命周期控制体
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     private fun getAppIconBase64(packageName: String): String? {
+        var bitmap: Bitmap? = null
+        var scaledBitmap: Bitmap? = null
         try {
             val iconDrawable: Drawable = packageManager.getApplicationIcon(packageName)
-            val bitmap = Bitmap.createBitmap(
+            bitmap = createBitmap(
                 iconDrawable.intrinsicWidth.coerceAtLeast(1),
                 iconDrawable.intrinsicHeight.coerceAtLeast(1),
                 Bitmap.Config.ARGB_8888
@@ -33,15 +45,22 @@ class MyNotificationListener : NotificationListenerService() {
             iconDrawable.setBounds(0, 0, canvas.width, canvas.height)
             iconDrawable.draw(canvas)
 
-            val scaledBitmap = Bitmap.createScaledBitmap(bitmap, 144, 144, true)
+            scaledBitmap = bitmap.scale(144, 144, true)
 
-            val outputStream = ByteArrayOutputStream()
-            scaledBitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
-            val byteArray = outputStream.toByteArray()
-            return Base64.encodeToString(byteArray, Base64.NO_WRAP)
+            ByteArrayOutputStream().use { outputStream ->
+                scaledBitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
+                val byteArray = outputStream.toByteArray()
+                return Base64.encodeToString(byteArray, Base64.NO_WRAP)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Failed to get icon for $packageName", e)
             return null
+        } finally {
+            // 显式回收图片资源，大幅降低高频通知下的内存膨胀与内存抖动频率
+            if (bitmap != scaledBitmap) {
+                bitmap?.recycle()
+            }
+            scaledBitmap?.recycle()
         }
     }
 
@@ -53,6 +72,8 @@ class MyNotificationListener : NotificationListenerService() {
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
         Log.w(TAG, "NotificationListener disconnected -- service is inactive")
+        // 当服务切断时销毁子协程任务
+        serviceScope.cancel()
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
@@ -83,26 +104,28 @@ class MyNotificationListener : NotificationListenerService() {
             val appName: String = try {
                 val appInfo = packageManager.getApplicationInfo(sbn.packageName, 0)
                 packageManager.getApplicationLabel(appInfo).toString()
-            } catch (e: PackageManager.NameNotFoundException) {
+            } catch (_: PackageManager.NameNotFoundException) {
                 sbn.packageName
             }
 
-            val messageId = "${sbn.key}_${sbn.postTime}"
-            val iconBase64 = getAppIconBase64(sbn.packageName)
+            // 将高强度的图片解析、压缩和编码逻辑整体丢入后台默认协程池处理，严禁阻塞监听主线程
+            serviceScope.launch {
+                if (AppManager.isAppAllowed(sbn.packageName)) {
+                    val messageId = "${sbn.key}_${sbn.postTime}"
+                    val iconBase64 = getAppIconBase64(sbn.packageName)
 
-            val message = NotificationMessage(
-                id = messageId, appName = appName, title = title,
-                content = content, timestamp = sbn.postTime,
-                iconBase64 = iconBase64
-            )
+                    val message = NotificationMessage(
+                        id = messageId, appName = appName, title = title,
+                        content = content, timestamp = sbn.postTime,
+                        iconBase64 = iconBase64
+                    )
 
-            //检查用户是否允许同步该应用的消息
-            if (AppManager.isAppAllowed(sbn.packageName)) {
-                Log.i(TAG, "Notification allowed and published: package=${sbn.packageName}, title=$title, content=$content")
-                //将通知发布至全局总线,由专门的协调器接管广播引信的发射逻辑
-                NotificationRepository.publish(message)
-            } else {
-                Log.i(TAG, "Notification blocked by settings: package=${sbn.packageName}")
+                    Log.i(TAG, "Notification allowed and published: package=${sbn.packageName}, title=$title, content=$content")
+                    //将通知发布至全局总线,由专门的协调器接管广播引信的发射逻辑
+                    NotificationRepository.publish(message)
+                } else {
+                    Log.i(TAG, "Notification blocked by settings: package=${sbn.packageName}")
+                }
             }
 
         } catch (e: Exception) {
@@ -113,5 +136,10 @@ class MyNotificationListener : NotificationListenerService() {
     override fun onNotificationRemoved(sbn: StatusBarNotification, rankingMap: RankingMap?, reason: Int) {
         super.onNotificationRemoved(sbn, rankingMap, reason)
         Log.d(TAG, "Notification removed: ${sbn.packageName} (reason=$reason)")
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        serviceScope.cancel()
     }
 }

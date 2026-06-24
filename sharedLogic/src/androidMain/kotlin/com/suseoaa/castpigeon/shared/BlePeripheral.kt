@@ -190,12 +190,17 @@ actual class BlePeripheral actual constructor() {
         }
         
         Log.i("BlePeripheral", "GattServer & Advertiser 初始化成功")
+        
+        // 核心修复：防止联发科等设备因为之前未彻底清理而累积多个相同的 Service，导致 macOS 疯狂重复订阅而崩溃断连
+        gattServer?.clearServices()
+        gattServer?.close()
+        
         gattServer = bluetoothManager.openGattServer(context, gattServerCallback)
         
         setupGattService()
 
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
             .setConnectable(true)
             .setTimeout(0)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
@@ -216,6 +221,10 @@ actual class BlePeripheral actual constructor() {
     @SuppressLint("MissingPermission")
     actual fun stopAdvertising() {
         advertiser?.stopAdvertising(advertiseCallback)
+        // 停止广播时必须彻底清理服务并关闭 Server，防止服务堆积（尤其是联发科/小米等魔改蓝牙栈）
+        gattServer?.clearServices()
+        gattServer?.close()
+        gattServer = null
     }
 
     @SuppressLint("MissingPermission")

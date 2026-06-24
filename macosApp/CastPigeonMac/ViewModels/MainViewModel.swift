@@ -81,8 +81,15 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     }
     
     func unbindDevice(hash: String) {
-        boundDeviceHashes.removeAll { $0 == hash }
+        boundDeviceHashes.removeAll { $0.hasSuffix("|\(hash)") || $0 == hash }
         UserDefaults.standard.set(boundDeviceHashes, forKey: "BoundDeviceHashes")
+    }
+    
+    func renameDevice(hash: String, newName: String) {
+        if let index = boundDeviceHashes.firstIndex(where: { $0.hasSuffix("|\(hash)") || $0 == hash }) {
+            boundDeviceHashes[index] = "\(newName)|\(hash)"
+            UserDefaults.standard.set(boundDeviceHashes, forKey: "BoundDeviceHashes")
+        }
     }
 
     func start(mode: WorkMode) {
@@ -93,8 +100,13 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
             }
             SwiftUdpDiscovery.shared.onPairingSuccess = { [weak self] boundDevice in
                 guard let self = self, self.workMode == .pairing else { return }
-                if !self.boundDeviceHashes.contains(boundDevice.hash_) {
-                    self.boundDeviceHashes.append(boundDevice.hash_)
+                let entry = "\(boundDevice.deviceName)|\(boundDevice.hash_)"
+                if !self.boundDeviceHashes.contains(where: { $0.hasSuffix("|\(boundDevice.hash_)") || $0 == boundDevice.hash_ }) {
+                    self.boundDeviceHashes.append(entry)
+                    UserDefaults.standard.set(self.boundDeviceHashes, forKey: "BoundDeviceHashes")
+                } else if let index = self.boundDeviceHashes.firstIndex(where: { $0 == boundDevice.hash_ }) {
+                    // Upgrade legacy hash-only entry to Name|Hash
+                    self.boundDeviceHashes[index] = entry
                     UserDefaults.standard.set(self.boundDeviceHashes, forKey: "BoundDeviceHashes")
                 }
                 self.showPinInput = false
@@ -178,7 +190,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
             service.characteristics = [dataChar, handshakeChar]
             peripheralManager.add(service)
             
-            if workMode != .idle && role == .sender {
+            if workMode == .working && role == .sender {
                 startAdvertising()
             }
         }
@@ -243,7 +255,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
         logDebug("蓝牙中心设备状态更新: \(central.state.rawValue)")
-        if central.state == .poweredOn && workMode != .idle && role == .receiver {
+        if central.state == .poweredOn && workMode == .working && role == .receiver {
             logDebug("蓝牙已开启，且处于工作模式，尝试开启扫描")
             startScan()
         }
@@ -307,8 +319,8 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         if workMode == .pairing {
             if !isPairingAd { return }
         } else if workMode == .working {
-            if isPairingAd { return }
-            if boundDeviceHashes.contains(hash) {
+            let isBound = boundDeviceHashes.contains { $0.hasSuffix("|\(hash)") || $0 == hash }
+            if isBound {
                 if connectedPeripherals[peripheral.identifier] == nil {
                     updateState(name: "Connecting", desc: "发现工作广播 [\(hash)]，发起连接...")
                     logDebug("发现目标设备[\(hash)]，发起连接...")
@@ -333,15 +345,14 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     }
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        self.connectedPeripherals.removeValue(forKey: peripheral.identifier)
         self.receiveBuffers.removeValue(forKey: peripheral.identifier)
         logDebug("设备已断开: \(error?.localizedDescription ?? "未知")")
-        if workMode != .idle {
-            updateState(name: "Scanning", desc: "有一台设备已断开，重新扫描...")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                self.startScan()
-            }
+        if workMode == .working {
+            updateState(name: "Connecting", desc: "连接中断，后台挂起重新监听该设备...")
+            // CoreBluetooth的黑科技：直接对已断开的外设发起connect，系统会自动在后台超低功耗死等，一旦设备再次广播瞬间连上
+            central.connect(peripheral, options: nil)
         } else {
+            self.connectedPeripherals.removeValue(forKey: peripheral.identifier)
             updateState(name: "Idle", desc: "静默期。")
             isAnimating = false
         }

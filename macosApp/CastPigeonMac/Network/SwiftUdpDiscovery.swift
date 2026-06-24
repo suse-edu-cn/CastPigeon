@@ -7,6 +7,7 @@ class SwiftUdpDiscovery {
     private var socketFD: Int32 = -1
     private var listenSource: DispatchSourceRead?
     private var broadcastTimer: DispatchSourceTimer?
+    private var restartTimer: DispatchSourceTimer?
     private let port: UInt16 = 48500
     
     var onDeviceDiscovered: (([UdpDevice]) -> Void)?
@@ -22,11 +23,7 @@ class SwiftUdpDiscovery {
     private var currentExpectedPin: String? = nil
     private var currentPairingTargetHash: String? = nil
     
-    func startListening(role: String, deviceName: String, hash: String) {
-        self.myPairingHash = hash
-        self.myRole = role
-        self.myName = deviceName
-        
+    private func setupSocket() {
         guard socketFD == -1 else { return }
         
         socketFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -65,6 +62,32 @@ class SwiftUdpDiscovery {
             self?.readData()
         }
         listenSource?.resume()
+    }
+    
+    func startListening(role: String, deviceName: String, hash: String) {
+        self.myPairingHash = hash
+        self.myRole = role
+        self.myName = deviceName
+        
+        setupSocket()
+        
+        // 启动看门狗定时器：解决 macOS 首次申请“本地网络”权限时，BSD Socket 被系统底层永久挂起（即使授权后也不恢复）的经典 Bug
+        restartTimer?.cancel()
+        restartTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .background))
+        restartTimer?.schedule(deadline: .now() + 3.0, repeating: 3.0)
+        restartTimer?.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            if self.devices.isEmpty && self.currentExpectedPin == nil {
+                self.listenSource?.cancel()
+                self.listenSource = nil
+                if self.socketFD != -1 {
+                    close(self.socketFD)
+                    self.socketFD = -1
+                }
+                self.setupSocket()
+            }
+        }
+        restartTimer?.resume()
     }
     
     private func readData() {
@@ -222,6 +245,8 @@ class SwiftUdpDiscovery {
         }
         broadcastTimer?.cancel()
         broadcastTimer = nil
+        restartTimer?.cancel()
+        restartTimer = nil
         
         myPairingHash = nil
         myRole = nil

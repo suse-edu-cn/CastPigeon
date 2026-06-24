@@ -8,10 +8,12 @@
     <string>CastPigeon</string>
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIconName</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.suseoaa.castpigeon.macos</string>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -26,10 +28,10 @@
     <string>13.0</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
-    <key>LSUIElement</key>
-    <true/>
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>CastPigeon 需要使用蓝牙来捕获手机端发出的近场同步引信信号。</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>CastPigeon 需要使用本地网络来发现并配对您的手机设备。</string>
     <key>NSBluetoothPeripheralUsageDescription</key>
     <string>CastPigeon 需要使用蓝牙与手机进行通信传输。</string>
 </dict>

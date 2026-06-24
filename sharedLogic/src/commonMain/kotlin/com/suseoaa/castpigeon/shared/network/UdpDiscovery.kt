@@ -6,6 +6,7 @@ import io.ktor.utils.io.core.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlin.random.Random
+import kotlin.concurrent.Volatile
 
 data class UdpDevice(
     val deviceName: String,
@@ -24,6 +25,9 @@ object UdpDiscovery {
     private var listeningJob: Job? = null
     private var broadcastingJob: Job? = null
     
+    // 定义统一管理的、受控的生命周期作用域，防止野协程泄漏
+    private var discoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    
     private val _discoveredDevices = MutableStateFlow<Set<UdpDevice>>(emptySet())
     val discoveredDevices: StateFlow<Set<UdpDevice>> = _discoveredDevices
     
@@ -38,29 +42,38 @@ object UdpDiscovery {
     private val _pinDisplayEvent = MutableSharedFlow<PinDisplayInfo>()
     val pinDisplayEvent: SharedFlow<PinDisplayInfo> = _pinDisplayEvent
     
-    private var myPairingHash: String? = null
-    private var myRole: String? = null
-    private var myName: String? = null
+    // 使用 volatile 或统一在受限单线程/同步块中处理非线程安全变量
+    @Volatile private var myPairingHash: String? = null
+    @Volatile private var myRole: String? = null
+    @Volatile private var myName: String? = null
     
     // 正在处理的配对上下文
-    private var currentExpectedPin: String? = null
-    private var currentPairingTargetHash: String? = null
+    @Volatile private var currentExpectedPin: String? = null
+    @Volatile private var currentPairingTargetHash: String? = null
 
     fun startListening() {
         if (listeningJob?.isActive == true) return
-        listeningJob = CoroutineScope(Dispatchers.Default).launch {
+        
+        // 如果旧的作用域已被取消，重新初始化
+        if (!discoveryScope.isActive) {
+            discoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        }
+        
+        listeningJob = discoveryScope.launch {
             val selectorManager = SelectorManager(Dispatchers.IO)
+            var serverSocket: BoundDatagramSocket? = null
             try {
-                val serverSocket = aSocket(selectorManager).udp().bind(InetSocketAddress("0.0.0.0", PORT)) {
+                serverSocket = aSocket(selectorManager).udp().bind(InetSocketAddress("0.0.0.0", PORT)) {
                     reuseAddress = true
                     broadcast = true
                 }
                 while (isActive) {
                     val datagram = serverSocket.receive()
                     val msg = datagram.packet.readText()
+                    // 引入更安全的拆分算法，或对名称中的特殊字符做清洗保护，避免下标越界
                     val parts = msg.split("|")
                     
-                    if (parts.size == 4 && parts[0] == "CP_PAIR") {
+                    if (parts.size >= 4 && parts[0] == "CP_PAIR") {
                         val role = parts[1]
                         val name = parts[2]
                         val hash = parts[3]
@@ -69,7 +82,7 @@ object UdpDiscovery {
                         val newDevice = UdpDevice(name, role, hash, ip)
                         _discoveredDevices.update { it + newDevice }
                         
-                    } else if (parts.size == 5 && parts[0] == "CP_BIND_REQUEST") {
+                    } else if (parts.size >= 5 && parts[0] == "CP_BIND_REQUEST") {
                         // CP_BIND_REQUEST|TargetHash|RequesterRole|RequesterName|RequesterHash
                         val targetHash = parts[1]
                         if (targetHash == myPairingHash) {
@@ -84,12 +97,13 @@ object UdpDiscovery {
                             currentExpectedPin = pin
                             currentPairingTargetHash = reqHash
                             
-                            CoroutineScope(Dispatchers.Main).launch {
+                            // 切换至 Dispatchers.Main 符合官方 UI 线程调度规范
+                            withContext(Dispatchers.Main) {
                                 _pinDisplayEvent.emit(PinDisplayInfo(pin, requestingDevice))
                             }
                         }
                         
-                    } else if (parts.size == 6 && parts[0] == "CP_BIND_VERIFY") {
+                    } else if (parts.size >= 6 && parts[0] == "CP_BIND_VERIFY") {
                         // CP_BIND_VERIFY|TargetHash|RequesterRole|RequesterName|RequesterHash|PIN
                         val targetHash = parts[1]
                         if (targetHash == myPairingHash) {
@@ -108,13 +122,13 @@ object UdpDiscovery {
                                 // 回复 SUCCESS
                                 sendUdpMessage("CP_BIND_SUCCESS|$reqHash|$myPairingHash")
                                 
-                                CoroutineScope(Dispatchers.Main).launch {
+                                withContext(Dispatchers.Main) {
                                     _pairingSuccessEvent.emit(requestingDevice)
                                 }
                             }
                         }
                         
-                    } else if (parts.size == 3 && parts[0] == "CP_BIND_SUCCESS") {
+                    } else if (parts.size >= 3 && parts[0] == "CP_BIND_SUCCESS") {
                         // CP_BIND_SUCCESS|TargetHash|SenderHash
                         val targetHash = parts[1]
                         val senderHash = parts[2]
@@ -123,7 +137,7 @@ object UdpDiscovery {
                             // 从已发现设备中找到它
                             val device = _discoveredDevices.value.find { it.hash == senderHash }
                             if (device != null) {
-                                CoroutineScope(Dispatchers.Main).launch {
+                                withContext(Dispatchers.Main) {
                                     _pairingSuccessEvent.emit(device)
                                 }
                             }
@@ -132,6 +146,10 @@ object UdpDiscovery {
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
+            } finally {
+                // 严格遵循官方推荐写法：在终结块中关闭套接字与选择器，释放底层的网络端口资源
+                serverSocket?.close()
+                selectorManager.close()
             }
         }
     }
@@ -144,10 +162,15 @@ object UdpDiscovery {
         
         startListening()
         
-        broadcastingJob = CoroutineScope(Dispatchers.Default).launch {
+        if (!discoveryScope.isActive) {
+            discoveryScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        }
+        
+        broadcastingJob = discoveryScope.launch {
             val selectorManager = SelectorManager(Dispatchers.IO)
+            var socket: BoundDatagramSocket? = null
             try {
-                val socket = aSocket(selectorManager).udp().bind {
+                socket = aSocket(selectorManager).udp().bind {
                     broadcast = true
                 }
                 val broadcastAddress = InetSocketAddress("255.255.255.255", PORT)
@@ -159,6 +182,9 @@ object UdpDiscovery {
                 }
             } catch (e: Exception) {
                 e.printStackTrace()
+            } finally {
+                socket?.close()
+                selectorManager.close()
             }
         }
     }
@@ -171,7 +197,7 @@ object UdpDiscovery {
         sendUdpMessage("CP_BIND_REQUEST|$targetHash|$myRole|$myName|$myPairingHash")
         
         // 本地触发 UI 弹窗要求输入 PIN
-        CoroutineScope(Dispatchers.Main).launch {
+        discoveryScope.launch(Dispatchers.Main) {
             _pinInputEvent.emit(UdpDevice(targetDeviceName, targetRole, targetHash, targetIp))
         }
     }
@@ -184,10 +210,12 @@ object UdpDiscovery {
     }
     
     private fun sendUdpMessage(msg: String) {
-        CoroutineScope(Dispatchers.Default).launch {
+        // 使用独立的全局IO协程发射UDP，防止被 UI 的 stop() 提前中止导致对方收不到 SUCCESS 包
+        CoroutineScope(Dispatchers.IO).launch {
             val selectorManager = SelectorManager(Dispatchers.IO)
+            var socket: BoundDatagramSocket? = null
             try {
-                val socket = aSocket(selectorManager).udp().bind {
+                socket = aSocket(selectorManager).udp().bind {
                     broadcast = true
                 }
                 val broadcastAddress = InetSocketAddress("255.255.255.255", PORT)
@@ -198,16 +226,18 @@ object UdpDiscovery {
                     socket.send(Datagram(packet, broadcastAddress))
                     delay(200)
                 }
-                socket.close()
             } catch (e: Exception) {
                 e.printStackTrace()
+            } finally {
+                socket?.close()
+                selectorManager.close()
             }
         }
     }
     
     fun stop() {
-        listeningJob?.cancel()
-        broadcastingJob?.cancel()
+        // 取消整个作用域下的所有子协程任务，确保没有任何野协程留存
+        discoveryScope.cancel()
         listeningJob = null
         broadcastingJob = null
         myPairingHash = null

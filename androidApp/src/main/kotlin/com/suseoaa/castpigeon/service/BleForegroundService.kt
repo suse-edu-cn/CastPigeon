@@ -29,11 +29,7 @@ class BleForegroundService : Service() {
         
         fun start(context: Context) {
             val intent = Intent(context, BleForegroundService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
-            }
+            context.startForegroundService(intent)
         }
         
         fun stop(context: Context) {
@@ -98,6 +94,33 @@ class BleForegroundService : Service() {
                 }
             }
         }
+
+        // 监听连接状态以实现断线自动重连
+        serviceScope.launch {
+            AppConnectionManager.stateMachine.state.collect { state ->
+                val workMode = AppConnectionManager.stateMachine.workMode.value
+                val role = AppConnectionManager.stateMachine.role.value
+                
+                // 如果当前处于工作模式但由于断线回退到了 Idle，Android端应重新开启广播
+                if (workMode == WorkMode.Working && state == ConnectionState.Idle && role == DeviceRole.Sender) {
+                    try {
+                        val deviceHash = getDeviceHash()
+                        AppConnectionManager.blePeripheral.startAdvertising(workMode, deviceHash) { newState, name ->
+                            AppConnectionManager.stateMachine.transitionTo(newState, name)
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            }
+        }
+    }
+
+    @android.annotation.SuppressLint("HardwareIds")
+    private fun getDeviceHash(): ByteArray {
+        val androidId = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID) ?: "unknown"
+        val bytes = java.security.MessageDigest.getInstance("SHA-256").digest(androidId.toByteArray())
+        return bytes.copyOfRange(0, 4)
     }
 
     private fun updateNotification() {
@@ -108,8 +131,8 @@ class BleForegroundService : Service() {
 
     private fun buildNotification(count: Int): Notification {
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            // 你需要提供一个小的图标，假设是 ic_launcher_foreground 或者类似系统图标
-            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            // 使用自定义的应用图标
+            .setSmallIcon(com.suseoaa.castpigeon.R.mipmap.ic_launcher_round)
             .setContentTitle("CastPigeon 正在运行")
             .setContentText("今日已收到 $count 条消息")
             .setPriority(NotificationCompat.PRIORITY_LOW)
@@ -118,16 +141,14 @@ class BleForegroundService : Service() {
     }
 
     private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(
-                CHANNEL_ID,
-                "CastPigeon 后台保活服务",
-                NotificationManager.IMPORTANCE_LOW
-            ).apply {
-                description = "维持蓝牙连接并在后台转发消息"
-            }
-            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-            notificationManager.createNotificationChannel(channel)
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "CastPigeon 后台保活服务",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply {
+            description = "维持蓝牙连接并在后台转发消息"
         }
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.createNotificationChannel(channel)
     }
 }

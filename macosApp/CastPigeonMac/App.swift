@@ -250,6 +250,9 @@ struct ModeCard: View {
 struct DevicesView: View {
     @EnvironmentObject var viewModel: MainViewModel
     @State private var showPairingSheet = false
+    @State private var showRenameSheet = false
+    @State private var editingHash: String = ""
+    @State private var editingName: String = ""
     
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -278,19 +281,30 @@ struct DevicesView: View {
                 if !viewModel.boundDeviceHashes.isEmpty {
                     ScrollView {
                         VStack(spacing: 12) {
-                            ForEach(viewModel.boundDeviceHashes, id: \.self) { hash in
+                            ForEach(viewModel.boundDeviceHashes, id: \.self) { entry in
+                                let parts = entry.components(separatedBy: "|")
+                                let name = parts.count > 1 ? parts[0] : "绑定的设备"
+                                let hash = parts.count > 1 ? parts[1] : entry
+                                
                                 HStack {
                                     Image(systemName: "iphone")
                                         .font(.system(size: 24))
                                         .foregroundColor(.blue)
                                     VStack(alignment: .leading) {
-                                        Text("绑定的手机")
+                                        Text(name)
                                             .font(.system(size: 15, weight: .semibold))
                                         Text("Hash: \(hash)")
                                             .font(.system(size: 12))
                                             .foregroundColor(.secondary)
                                     }
                                     Spacer()
+                                    Button("重命名") {
+                                        editingHash = hash
+                                        editingName = name
+                                        showRenameSheet = true
+                                    }
+                                    .buttonStyle(.bordered)
+                                    
                                     Button("解绑") {
                                         withAnimation { viewModel.unbindDevice(hash: hash) }
                                     }
@@ -321,6 +335,28 @@ struct DevicesView: View {
         .sheet(isPresented: $showPairingSheet) {
             PairingSheetView()
                 .environmentObject(viewModel)
+        }
+        .sheet(isPresented: $showRenameSheet) {
+            VStack(spacing: 20) {
+                Text("重命名设备")
+                    .font(.system(size: 18, weight: .bold))
+                TextField("设备名称", text: $editingName)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 250)
+                HStack(spacing: 20) {
+                    Button("取消") { showRenameSheet = false }
+                        .buttonStyle(.bordered)
+                    Button("保存") {
+                        if !editingName.isEmpty {
+                            viewModel.renameDevice(hash: editingHash, newName: editingName)
+                        }
+                        showRenameSheet = false
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .padding()
+            .frame(width: 300, height: 180)
         }
     }
 }
