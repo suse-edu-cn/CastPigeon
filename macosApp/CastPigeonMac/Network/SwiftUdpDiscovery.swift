@@ -23,6 +23,16 @@ class SwiftUdpDiscovery {
     private var currentExpectedPin: String? = nil
     private var currentPairingTargetHash: String? = nil
     private let ignoredBroadcastInterfacePrefixes = ["lo", "utun", "awdl", "llw", "bridge", "feth", "gif", "stf"]
+
+    private func sortedDevices() -> [UdpDevice] {
+        devices.sorted {
+            let lhsName = $0.deviceName.localizedCaseInsensitiveCompare($1.deviceName)
+            if lhsName != .orderedSame {
+                return lhsName == .orderedAscending
+            }
+            return $0.hash_ < $1.hash_
+        }
+    }
     
     private func setupSocket() {
         guard socketFD == -1 else { return }
@@ -118,7 +128,7 @@ class SwiftUdpDiscovery {
             DispatchQueue.main.async {
                 self.devices = Set(self.devices.filter { $0.hash_ != newDevice.hash_ })
                 self.devices.insert(newDevice)
-                self.onDeviceDiscovered?(Array(self.devices))
+                self.onDeviceDiscovered?(self.sortedDevices())
             }
             
         } else if parts.count == 5 && parts[0] == "CP_BIND_REQUEST" {

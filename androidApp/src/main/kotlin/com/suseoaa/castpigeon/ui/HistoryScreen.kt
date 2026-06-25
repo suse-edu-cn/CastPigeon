@@ -41,7 +41,11 @@ fun HistoryScreen() {
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+    ) {
         Box(modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(horizontal = 24.dp, vertical = 16.dp)) {
             Text("发送历史记录", fontSize = 24.sp, fontWeight = FontWeight.Bold)
         }

@@ -187,7 +187,7 @@ struct DashboardView: View {
                 }
                 ScrollView {
                     VStack(alignment: .leading, spacing: 4) {
-                        ForEach(viewModel.debugLogs, id: \.self) { log in
+                        ForEach(Array(viewModel.debugLogs.enumerated()), id: \.offset) { _, log in
                             Text(log)
                                 .font(.system(.body, design: .monospaced))
                                 .foregroundColor(.primary)
@@ -394,7 +394,7 @@ struct DevicesView: View {
                 } else {
                     ScrollView {
                         VStack(spacing: 12) {
-                            ForEach(viewModel.udpDevices, id: \.self) { device in
+                            ForEach(viewModel.udpDevices, id: \.hash_) { device in
                                 HStack {
                                     Image(systemName: device.deviceType == "Mac" ? "desktopcomputer" : "iphone")
                                         .font(.system(size: 24))

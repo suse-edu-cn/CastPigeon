@@ -50,6 +50,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     private var peripheralManager: CBPeripheralManager!
     private var connectedPeripherals: [UUID: CBPeripheral] = [:]
     private var peripheralHashes: [UUID: String] = [:]
+    private var connectingDeviceHashes: Set<String> = []
     private var controlCharacteristics: [UUID: CBCharacteristic] = [:]
     private var lastCapabilitySentAt: Date = .distantPast
     private var cancellables: Set<AnyCancellable> = []
@@ -62,6 +63,16 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     private let serviceUuid = CBUUID(string: "A1B2C3D4-E5F6-47A8-B9C0-D1E2F3A4B5C6")
     private let charUuid = CBUUID(string: "A1B2C3D4-E5F6-47A8-B9C0-D1E2F3A4B5C7")
     private let handshakeCharUuid = CBUUID(string: "A1B2C3D4-E5F6-47A8-B9C0-D1E2F3A4B5C8")
+
+    private func sortUdpDevices(_ devices: [UdpDevice]) -> [UdpDevice] {
+        devices.sorted {
+            let lhsName = $0.deviceName.localizedCaseInsensitiveCompare($1.deviceName)
+            if lhsName != .orderedSame {
+                return lhsName == .orderedAscending
+            }
+            return $0.hash_ < $1.hash_
+        }
+    }
 
     override init() {
         super.init()
@@ -206,6 +217,8 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
             connectedPeripherals.removeAll()
             receiveBuffers.removeAll()
             controlCharacteristics.removeAll()
+            peripheralHashes.removeAll()
+            connectingDeviceHashes.removeAll()
         } else {
             peripheralManager.stopAdvertising()
         }
@@ -398,6 +411,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         DispatchQueue.main.async {
             self.udpDevices.removeAll { $0.hash_ == device.hash_ }
             self.udpDevices.append(device)
+            self.udpDevices = self.sortUdpDevices(self.udpDevices)
         }
         logDebug("收到 BLE 能力信息: \(device.deviceName) \(device.ip ?? "-"):\(device.filePort.map(String.init) ?? "-")")
     }
@@ -584,11 +598,14 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         } else if workMode == .working {
             let isBound = boundDeviceHashes.contains { $0.hasSuffix("|\(hash)") || $0 == hash }
             if isBound {
-                if connectedPeripherals[peripheral.identifier] == nil {
+                if connectedPeripherals[peripheral.identifier] == nil &&
+                    !connectingDeviceHashes.contains(hash) &&
+                    !connectedDeviceHashes.contains(hash) {
                     updateState(name: "Connecting", desc: "发现工作广播 [\(hash)]，发起连接...")
                     logDebug("发现目标设备[\(hash)]，发起连接...")
                     connectedPeripherals[peripheral.identifier] = peripheral
                     peripheralHashes[peripheral.identifier] = hash
+                    connectingDeviceHashes.insert(hash)
                     peripheral.delegate = self
                     central.connect(peripheral, options: nil)
                 }
@@ -600,6 +617,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         updateState(name: "Handshake", desc: "底层连接建立，发起握手...")
         logDebug("设备已连接，发现服务...")
         if let hash = peripheralHashes[peripheral.identifier] {
+            connectingDeviceHashes.remove(hash)
             DispatchQueue.main.async {
                 self.connectedDeviceHashes.insert(hash)
             }
@@ -609,26 +627,38 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
         logDebug("设备连接失败: \(error?.localizedDescription ?? "未知错误")")
-        connectedPeripherals.removeValue(forKey: peripheral.identifier)
         if let hash = peripheralHashes[peripheral.identifier] {
+            connectingDeviceHashes.remove(hash)
             DispatchQueue.main.async { self.connectedDeviceHashes.remove(hash) }
         }
+        connectedPeripherals.removeValue(forKey: peripheral.identifier)
+        peripheralHashes.removeValue(forKey: peripheral.identifier)
+        controlCharacteristics.removeValue(forKey: peripheral.identifier)
     }
     
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         self.receiveBuffers.removeValue(forKey: peripheral.identifier)
         logDebug("设备已断开: \(error?.localizedDescription ?? "未知")")
         
+        let hash = peripheralHashes[peripheral.identifier]
         if let hash = peripheralHashes[peripheral.identifier] {
+            connectingDeviceHashes.remove(hash)
             DispatchQueue.main.async { self.connectedDeviceHashes.remove(hash) }
         }
+        self.connectedPeripherals.removeValue(forKey: peripheral.identifier)
+        self.peripheralHashes.removeValue(forKey: peripheral.identifier)
+        self.controlCharacteristics.removeValue(forKey: peripheral.identifier)
         
         if workMode == .working {
             updateState(name: "Connecting", desc: "连接中断，后台挂起重新监听该设备...")
-            // CoreBluetooth的黑科技：直接对已断开的外设发起connect，系统会自动在后台超低功耗死等，一旦设备再次广播瞬间连上
-            central.connect(peripheral, options: nil)
+            if let hash {
+                connectingDeviceHashes.insert(hash)
+                self.connectedPeripherals[peripheral.identifier] = peripheral
+                self.peripheralHashes[peripheral.identifier] = hash
+                // CoreBluetooth的黑科技：直接对已断开的外设发起connect，系统会自动在后台超低功耗死等，一旦设备再次广播瞬间连上
+                central.connect(peripheral, options: nil)
+            }
         } else {
-            self.connectedPeripherals.removeValue(forKey: peripheral.identifier)
             updateState(name: "Idle", desc: "静默期。")
             isAnimating = false
         }
@@ -745,7 +775,8 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
                 }
             }
         } catch {
-            self.logDebug("解码通知失败: \(error.localizedDescription)")
+            let preview = String(data: data.prefix(160), encoding: .utf8) ?? "<non-utf8>"
+            self.logDebug("解码通知失败: \(error.localizedDescription), payload=\(preview)")
         }
     }
 }

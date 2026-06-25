@@ -16,9 +16,12 @@ import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.os.ParcelUuid
 import android.util.Log
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.UUID
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 object BleContextHolder {
     @SuppressLint("StaticFieldLeak")
@@ -34,7 +37,7 @@ actual class BlePeripheral actual constructor() {
 
     private var advertiser: BluetoothLeAdvertiser? = null
     
-    private val notifyMutex = Mutex()
+    private val sendMutex = Mutex()
     private var gattServer: BluetoothGattServer? = null
     private var connectedDevice: BluetoothDevice? = null
     private var characteristic: BluetoothGattCharacteristic? = null
@@ -42,6 +45,10 @@ actual class BlePeripheral actual constructor() {
     private var handshakeCharacteristic: BluetoothGattCharacteristic? = null
     actual var onMessageReceived: ((String) -> Unit)? = null
     private val writeBuffers = java.util.concurrent.ConcurrentHashMap<String, java.io.ByteArrayOutputStream>()
+    private var pendingAdvertiseSettings: AdvertiseSettings? = null
+    private var pendingAdvertiseData: AdvertiseData? = null
+    @Volatile
+    private var pendingNotificationAck: CompletableDeferred<Int>? = null
 
     //CastPigeon专属的跨端通信UUID，用于广播和过滤
     private val serviceUuid = UUID.fromString("A1B2C3D4-E5F6-47A8-B9C0-D1E2F3A4B5C6")
@@ -78,6 +85,7 @@ actual class BlePeripheral actual constructor() {
     private val gattServerCallback = object : BluetoothGattServerCallback() {
         override fun onConnectionStateChange(device: BluetoothDevice?, status: Int, newState: Int) {
             super.onConnectionStateChange(device, status, newState)
+            Log.i("BlePeripheral", "onConnectionStateChange status=$status newState=$newState device=${device?.address}")
             if (newState == android.bluetooth.BluetoothProfile.STATE_CONNECTED) {
                 connectedDevice = device
                 //不在这里直接跃迁为Connecting，而是等待macOS写入身份
@@ -183,6 +191,7 @@ actual class BlePeripheral actual constructor() {
         ) {
             super.onDescriptorWriteRequest(device, requestId, descriptor, preparedWrite, responseNeeded, offset, value)
             if (device == null) return
+            Log.i("BlePeripheral", "onDescriptorWriteRequest uuid=${descriptor?.uuid} value=${value?.joinToString()}")
             if (responseNeeded) {
                 @SuppressLint("MissingPermission")
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, value)
@@ -192,6 +201,7 @@ actual class BlePeripheral actual constructor() {
         override fun onMtuChanged(device: BluetoothDevice?, mtu: Int) {
             super.onMtuChanged(device, mtu)
             currentMtu = mtu
+            Log.i("BlePeripheral", "onMtuChanged mtu=$mtu device=${device?.address}")
             //macOS端主动发起MTU=512协商，此处接收协商结果
             if (device?.address == connectedDevice?.address) {
                 //如果是已经授权的设备，在MTU协商后进入传输期
@@ -203,8 +213,24 @@ actual class BlePeripheral actual constructor() {
 
         override fun onNotificationSent(device: BluetoothDevice?, status: Int) {
             super.onNotificationSent(device, status)
-            if (notifyMutex.isLocked) {
-                notifyMutex.unlock()
+            pendingNotificationAck?.complete(status)
+        }
+
+        override fun onServiceAdded(status: Int, service: BluetoothGattService?) {
+            super.onServiceAdded(status, service)
+            Log.i("BlePeripheral", "onServiceAdded status=$status uuid=${service?.uuid}")
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                stateListener?.invoke(ConnectionState.Idle, null)
+                return
+            }
+
+            val advertiserToStart = advertiser
+            val settings = pendingAdvertiseSettings
+            val data = pendingAdvertiseData
+            if (advertiserToStart != null && settings != null && data != null) {
+                advertiserToStart.startAdvertising(settings, data, advertiseCallback)
+                pendingAdvertiseSettings = null
+                pendingAdvertiseData = null
             }
         }
     }
@@ -268,7 +294,9 @@ actual class BlePeripheral actual constructor() {
             .addServiceData(ParcelUuid.fromString("0000FF01-0000-1000-8000-00805F9B34FB"), finalHash)
             .build()
 
-        advertiser?.startAdvertising(settings, data, advertiseCallback)
+        pendingAdvertiseSettings = settings
+        pendingAdvertiseData = data
+        Log.i("BlePeripheral", "等待 GATT Service 注册完成后再启动广播")
     }
 
     @SuppressLint("MissingPermission")
@@ -305,52 +333,64 @@ actual class BlePeripheral actual constructor() {
 
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
             try {
-                // 发送开始标记
-                var startSent = false
-                while (!startSent) {
-                    notifyMutex.lock()
-                    char.value = byteArrayOf(0x00, 0x01, 0x02, 0x03)
-                    if (!server.notifyCharacteristicChanged(device, char, false)) { 
-                        notifyMutex.unlock()
-                        kotlinx.coroutines.delay(50) 
-                    } else {
-                        startSent = true
-                    }
-                }
-                
-                // 分片发送数据
-                // 限制最大为 500 避免 Android 底层蓝牙栈的 513 字节缓冲区溢出崩溃
-                val chunkSize = minOf(500, maxOf(20, currentMtu - 3))
-                var offset = 0
-                while (offset < payload.size) {
-                    val length = minOf(chunkSize, payload.size - offset)
-                    notifyMutex.lock()
-                    char.value = payload.copyOfRange(offset, offset + length)
-                    if (!server.notifyCharacteristicChanged(device, char, false)) { 
-                        notifyMutex.unlock()
+                sendMutex.withLock {
+                    // 发送开始标记
+                    while (!sendChunk(server, device, char, byteArrayOf(0x00, 0x01, 0x02, 0x03))) {
                         kotlinx.coroutines.delay(50)
-                        continue // 重试当前分片，不增加 offset
                     }
-                    offset += length
-                }
-                
-                // 发送结束标记
-                var endSent = false
-                while (!endSent) {
-                    notifyMutex.lock()
-                    char.value = byteArrayOf(0xFF.toByte(), 0xFE.toByte(), 0xFD.toByte(), 0xFC.toByte())
-                    if (!server.notifyCharacteristicChanged(device, char, false)) {
-                        notifyMutex.unlock()
+
+                    // 分片发送数据
+                    // 限制最大为 500 避免 Android 底层蓝牙栈的 513 字节缓冲区溢出崩溃
+                    val chunkSize = minOf(500, maxOf(20, currentMtu - 3))
+                    var offset = 0
+                    while (offset < payload.size) {
+                        val length = minOf(chunkSize, payload.size - offset)
+                        val chunk = payload.copyOfRange(offset, offset + length)
+                        if (!sendChunk(server, device, char, chunk)) {
+                            kotlinx.coroutines.delay(50)
+                            continue
+                        }
+                        offset += length
+                    }
+
+                    // 发送结束标记
+                    while (!sendChunk(server, device, char, byteArrayOf(0xFF.toByte(), 0xFE.toByte(), 0xFD.toByte(), 0xFC.toByte()))) {
                         kotlinx.coroutines.delay(50)
-                    } else {
-                        endSent = true
                     }
                 }
             } catch (e: Exception) {
                 Log.e("BlePeripheral", "分包发送失败", e)
-                if (notifyMutex.isLocked) notifyMutex.unlock()
+                pendingNotificationAck = null
             }
         }
+    }
+
+    private suspend fun sendChunk(
+        server: BluetoothGattServer,
+        device: BluetoothDevice,
+        char: BluetoothGattCharacteristic,
+        chunk: ByteArray
+    ): Boolean {
+        val ack = CompletableDeferred<Int>()
+        pendingNotificationAck = ack
+        char.value = chunk
+        val started = server.notifyCharacteristicChanged(device, char, false)
+        if (!started) {
+            pendingNotificationAck = null
+            return false
+        }
+
+        val status = withTimeoutOrNull(2_000) { ack.await() }
+        pendingNotificationAck = null
+        if (status == null) {
+            Log.w("BlePeripheral", "等待通知发送确认超时，chunkSize=${chunk.size}")
+            return false
+        }
+        if (status != BluetoothGatt.GATT_SUCCESS) {
+            Log.w("BlePeripheral", "通知发送确认失败，status=$status, chunkSize=${chunk.size}")
+            return false
+        }
+        return true
     }
 
     private fun setupGattService() {

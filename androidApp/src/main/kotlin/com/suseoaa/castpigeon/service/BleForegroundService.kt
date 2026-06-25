@@ -37,6 +37,7 @@ import java.net.Inet4Address
 class BleForegroundService : Service() {
 
     companion object {
+        private const val MAX_BLE_NOTIFICATION_BYTES = 420
         private const val CHANNEL_ID = "CastPigeonBleChannel"
         private const val NOTIFICATION_ID = 1001
         var isInternalClipboardWrite = false
@@ -374,7 +375,11 @@ class BleForegroundService : Service() {
                 // 如果符合发送条件，则通过蓝牙发送
                 if (role == DeviceRole.Sender && workMode == WorkMode.Working && connectionState == ConnectionState.Transferring) {
                     try {
-                        val jsonStr = Json.encodeToString(message)
+                        val jsonStr = encodeNotificationForBle(message) ?: run {
+                            android.util.Log.w("CastPigeon", "通知过长且无法压缩到 BLE 安全范围，已跳过: ${message.title}")
+                            return@collect
+                        }
+                        android.util.Log.i("CastPigeon", "发送 BLE 通知: bytes=${jsonStr.encodeToByteArray().size}, title=${message.title}")
                         AppConnectionManager.crypto.computeSharedSecret(AppConnectionManager.crypto.getPublicKeyBytes())
                         AppConnectionManager.blePeripheral.sendNotificationData(jsonStr.encodeToByteArray())
                     } catch (e: Exception) {
@@ -467,6 +472,36 @@ class BleForegroundService : Service() {
             
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notificationManager.notify(1002, notif)
+    }
+
+    private fun encodeNotificationForBle(message: com.suseoaa.castpigeon.shared.NotificationMessage): String? {
+        fun encode(candidate: com.suseoaa.castpigeon.shared.NotificationMessage): String {
+            return Json.encodeToString(candidate)
+        }
+
+        fun fits(json: String): Boolean = json.encodeToByteArray().size <= MAX_BLE_NOTIFICATION_BYTES
+
+        var candidate = message.copy(iconBase64 = null)
+        var json = encode(candidate)
+        if (fits(json)) return json
+
+        var content = candidate.content
+        while (content.isNotEmpty()) {
+            content = content.dropLast(1)
+            candidate = candidate.copy(content = content)
+            json = encode(candidate)
+            if (fits(json)) return json
+        }
+
+        var title = candidate.title
+        while (title.isNotEmpty()) {
+            title = title.dropLast(1)
+            candidate = candidate.copy(title = title)
+            json = encode(candidate)
+            if (fits(json)) return json
+        }
+
+        return if (fits(json)) json else null
     }
 
     private fun sendLocalCapabilityOverBle(reason: String) {
