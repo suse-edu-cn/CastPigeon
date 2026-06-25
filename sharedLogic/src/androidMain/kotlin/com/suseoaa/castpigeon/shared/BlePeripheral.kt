@@ -154,7 +154,7 @@ actual class BlePeripheral actual constructor() {
             val text = try { String(value) } catch (e: Exception) { null }
             Log.i("BlePeripheral", "processCharacteristicWrite: length=${value.size}, textSnippet=${if (text != null && text.length > 20) text.take(20) else text}")
             
-            if (text != null && text.startsWith("CLIP|")) {
+            if (text != null && (text.startsWith("CLIP|") || text.startsWith("CAP|"))) {
                 onMessageReceived?.invoke(text)
                 return
             }

@@ -14,5 +14,8 @@ class CastPigeonApp : Application() {
 
         // 初始化特权管理器
         com.suseoaa.castpigeon.service.PrivilegeManager.init(this)
+
+        // 启动局域网文件接收服务
+        com.suseoaa.castpigeon.service.LanFileTransferManager.startServer(this)
     }
 }

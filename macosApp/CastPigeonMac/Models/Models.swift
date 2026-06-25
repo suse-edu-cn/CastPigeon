@@ -16,6 +16,8 @@ struct UdpDevice: Hashable {
     let role: String
     let hash_: String
     var ip: String? = nil
+    var filePort: Int? = nil
+    var deviceType: String = "Unknown"
 }
 
 struct NotificationMessage: Codable {

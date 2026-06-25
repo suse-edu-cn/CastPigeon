@@ -22,6 +22,7 @@ class SwiftUdpDiscovery {
     
     private var currentExpectedPin: String? = nil
     private var currentPairingTargetHash: String? = nil
+    private let ignoredBroadcastInterfacePrefixes = ["lo", "utun", "awdl", "llw", "bridge", "feth", "gif", "stf"]
     
     private func setupSocket() {
         guard socketFD == -1 else { return }
@@ -110,9 +111,12 @@ class SwiftUdpDiscovery {
         
         let parts = msg.components(separatedBy: "|")
         
-        if parts.count == 4 && parts[0] == "CP_PAIR" {
-            let newDevice = UdpDevice(deviceName: parts[2], role: parts[1], hash_: parts[3], ip: ipString)
+        if parts.count >= 4 && parts[0] == "CP_PAIR" {
+            let filePort = parts.count >= 5 ? Int(parts[4]) : nil
+            let deviceType = parts.count >= 6 ? parts[5] : "Unknown"
+            let newDevice = UdpDevice(deviceName: parts[2], role: parts[1], hash_: parts[3], ip: ipString, filePort: filePort.flatMap { $0 > 0 ? $0 : nil }, deviceType: deviceType)
             DispatchQueue.main.async {
+                self.devices = Set(self.devices.filter { $0.hash_ != newDevice.hash_ })
                 self.devices.insert(newDevice)
                 self.onDeviceDiscovered?(Array(self.devices))
             }
@@ -170,10 +174,10 @@ class SwiftUdpDiscovery {
         }
     }
     
-    func startBroadcasting(role: String, deviceName: String, hash: String) {
+    func startBroadcasting(role: String, deviceName: String, hash: String, filePort: Int? = nil, deviceType: String = "Mac") {
         startListening(role: role, deviceName: deviceName, hash: hash)
         
-        let msg = "CP_PAIR|\(role)|\(deviceName)|\(hash)"
+        let msg = "CP_PAIR|\(role)|\(deviceName)|\(hash)|\(filePort ?? 0)|\(deviceType)"
         
         broadcastTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
         broadcastTimer?.schedule(deadline: .now(), repeating: 1.0)
@@ -208,24 +212,23 @@ class SwiftUdpDiscovery {
         var broadcast: Int32 = 1
         setsockopt(tempSocket, SOL_SOCKET, SO_BROADCAST, &broadcast, socklen_t(MemoryLayout<Int32>.size))
         
-        var addr = sockaddr_in()
-        addr.sin_family = sa_family_t(AF_INET)
-        addr.sin_port = port.bigEndian
+        let targets = udpTargets(for: targetIp)
         
-        if let targetIp = targetIp, !targetIp.isEmpty {
-            addr.sin_addr.s_addr = inet_addr(targetIp)
-        } else {
-            addr.sin_addr.s_addr = inet_addr("255.255.255.255")
-        }
-        
-        // 发送3次，不依赖 RunLoop
+        // 发送3次，不依赖 RunLoop；广播时逐个真实网卡的广播地址发送，避免 TUN/VPN 接管 255.255.255.255。
         DispatchQueue.global(qos: .userInitiated).async {
             for _ in 0..<3 {
-                data.withUnsafeBytes { rawBuffer in
-                    if let baseAddress = rawBuffer.baseAddress {
-                        withUnsafePointer(to: &addr) {
-                            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { addrPtr in
-                                sendto(tempSocket, baseAddress, data.count, 0, addrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                for target in targets {
+                    var addr = sockaddr_in()
+                    addr.sin_family = sa_family_t(AF_INET)
+                    addr.sin_port = self.port.bigEndian
+                    addr.sin_addr.s_addr = inet_addr(target)
+
+                    data.withUnsafeBytes { rawBuffer in
+                        if let baseAddress = rawBuffer.baseAddress {
+                            withUnsafePointer(to: &addr) {
+                                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { addrPtr in
+                                    sendto(tempSocket, baseAddress, data.count, 0, addrPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+                                }
                             }
                         }
                     }
@@ -234,6 +237,62 @@ class SwiftUdpDiscovery {
             }
             close(tempSocket)
         }
+    }
+
+    private func udpTargets(for targetIp: String?) -> [String] {
+        if let targetIp = targetIp, !targetIp.isEmpty {
+            return [targetIp]
+        }
+
+        let interfaceBroadcasts = activeIPv4BroadcastAddresses()
+        return interfaceBroadcasts.isEmpty ? ["255.255.255.255"] : interfaceBroadcasts
+    }
+
+    private func activeIPv4BroadcastAddresses() -> [String] {
+        var interfaces: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfaces) == 0, let first = interfaces else {
+            return []
+        }
+        defer { freeifaddrs(interfaces) }
+
+        var broadcasts: [String] = []
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = cursor {
+            defer { cursor = current.pointee.ifa_next }
+
+            let flags = Int32(current.pointee.ifa_flags)
+            guard (flags & IFF_UP) != 0,
+                  (flags & IFF_RUNNING) != 0,
+                  (flags & IFF_BROADCAST) != 0,
+                  let address = current.pointee.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET),
+                  let broadcastAddress = current.pointee.ifa_dstaddr else {
+                continue
+            }
+
+            let interfaceName = String(cString: current.pointee.ifa_name)
+            if ignoredBroadcastInterfacePrefixes.contains(where: { interfaceName.hasPrefix($0) }) {
+                continue
+            }
+
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = getnameinfo(
+                broadcastAddress,
+                socklen_t(broadcastAddress.pointee.sa_len),
+                &host,
+                socklen_t(host.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            )
+            if result == 0 {
+                let ip = String(cString: host)
+                if !broadcasts.contains(ip) {
+                    broadcasts.append(ip)
+                }
+            }
+        }
+        return broadcasts
     }
     
     func stop() {

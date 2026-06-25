@@ -24,6 +24,11 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     
     private var clipboardTimer: Timer?
     private var lastClipboardChangeCount: Int = NSPasteboard.general.changeCount
+    private var lastClipboardSentText: String? = nil
+    private var lastClipboardSentAt: Date = .distantPast
+    private var lastClipboardReceivedText: String? = nil
+    private var lastClipboardReceivedAt: Date = .distantPast
+    private let clipboardDedupWindow: TimeInterval = 4
     
     private var receiveBuffers: [UUID: Data] = [:]
     @Published var debugLogs: [String] = []
@@ -32,6 +37,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     @Published var discoveredDevices: Set<String> = []
     @Published var connectedDeviceHashes: Set<String> = []
     @Published var udpDevices: [UdpDevice] = []
+    @Published var fileTransferStatus: LanFileTransferManager.TransferStatus? = nil
     
     @Published var showPinDisplay: Bool = false
     @Published var displayPin: String = ""
@@ -44,6 +50,9 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     private var peripheralManager: CBPeripheralManager!
     private var connectedPeripherals: [UUID: CBPeripheral] = [:]
     private var peripheralHashes: [UUID: String] = [:]
+    private var controlCharacteristics: [UUID: CBCharacteristic] = [:]
+    private var lastCapabilitySentAt: Date = .distantPast
+    private var cancellables: Set<AnyCancellable> = []
     
     // Server state
     private var gattCharacteristic: CBMutableCharacteristic?
@@ -56,12 +65,22 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
 
     override init() {
         super.init()
+        LanFileTransferManager.shared.startServer()
         centralManager = CBCentralManager(delegate: self, queue: nil)
         peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
         
         clipboardTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             self?.checkClipboard()
         }
+
+        LanFileTransferManager.shared.$transferStatus
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] status in
+                self?.fileTransferStatus = status
+                guard let self, let status, status.phase != .inProgress else { return }
+                self.showFileTransferNotification(status)
+            }
+            .store(in: &cancellables)
         
         if !boundDeviceHashes.isEmpty {
             self.workMode = .working
@@ -77,6 +96,13 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         let name = Host.current().localizedName ?? "Mac"
         let hash = abs(name.hashValue) % 10000
         return String(format: "%04X", hash)
+    }
+
+    private var localCapabilityPayload: String {
+        let name = Host.current().localizedName ?? "Mac"
+        let ip = localIPv4Address() ?? ""
+        let port = LanFileTransferManager.shared.serverPort
+        return "CAP|\(name)|\(myHash)|\(ip)|\(port)|Mac"
     }
 
     func bindDevice(device: UdpDevice) {
@@ -136,17 +162,24 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
                 self?.inputTargetDevice = device
                 self?.showPinInput = true
             }
+            SwiftUdpDiscovery.shared.onDeviceDiscovered = { [weak self] devices in
+                self?.udpDevices = devices
+            }
             
             if role == .receiver {
-                SwiftUdpDiscovery.shared.startListening(role: "Receiver", deviceName: Host.current().localizedName ?? "Mac", hash: myHash)
+                SwiftUdpDiscovery.shared.startBroadcasting(role: "Receiver", deviceName: Host.current().localizedName ?? "Mac", hash: myHash, filePort: LanFileTransferManager.shared.serverPort, deviceType: "Mac")
                 isAnimating = true
                 updateState(name: "Pairing", desc: "正在局域网中寻找发送端...")
             } else {
-                SwiftUdpDiscovery.shared.startBroadcasting(role: "Sender", deviceName: Host.current().localizedName ?? "Mac", hash: myHash)
+                SwiftUdpDiscovery.shared.startBroadcasting(role: "Sender", deviceName: Host.current().localizedName ?? "Mac", hash: myHash, filePort: LanFileTransferManager.shared.serverPort, deviceType: "Mac")
                 isAnimating = true
                 updateState(name: "Pairing", desc: "正在局域网中广播自己的位置...")
             }
         } else {
+            SwiftUdpDiscovery.shared.onDeviceDiscovered = { [weak self] devices in
+                self?.udpDevices = devices
+            }
+            SwiftUdpDiscovery.shared.startBroadcasting(role: role.rawValue, deviceName: Host.current().localizedName ?? "Mac", hash: myHash, filePort: LanFileTransferManager.shared.serverPort, deviceType: "Mac")
             if role == .receiver {
                 logDebug("进入 .receiver 的工作模式，调用 startScan")
                 startScan()
@@ -172,6 +205,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
             }
             connectedPeripherals.removeAll()
             receiveBuffers.removeAll()
+            controlCharacteristics.removeAll()
         } else {
             peripheralManager.stopAdvertising()
         }
@@ -214,6 +248,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         if characteristic.uuid == charUuid {
             subscribedCentrals.append(central)
             updateState(name: "Transferring", desc: "手机已连接并订阅通知，可以发送消息了。")
+            sendLocalCapability(reason: "手机订阅通知")
         }
     }
     
@@ -223,10 +258,13 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
                 if let data = request.value, let text = String(data: data, encoding: .utf8), text.hasPrefix("CLIP|") {
                     let clipText = String(text.dropFirst(5))
                     DispatchQueue.main.async {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(clipText, forType: .string)
-                        self.lastClipboardChangeCount = NSPasteboard.general.changeCount
+                        self.applyIncomingClipboardText(clipText)
                     }
+                    peripheralManager.respond(to: request, withResult: .success)
+                    return
+                }
+                if let data = request.value, let text = String(data: data, encoding: .utf8), text.hasPrefix("CAP|") {
+                    handleCapabilityPayload(text)
                     peripheralManager.respond(to: request, withResult: .success)
                     return
                 }
@@ -250,9 +288,61 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         lastClipboardChangeCount = currentCount
         
         if let text = NSPasteboard.general.string(forType: .string) {
+            if shouldIgnoreOutgoingClipboardText(text) {
+                return
+            }
+            lastClipboardSentText = text
+            lastClipboardSentAt = Date()
             let payload = "CLIP|" + text
             sendClipboardPayload(payload)
         }
+    }
+
+    private func applyIncomingClipboardText(_ clipText: String) {
+        if shouldIgnoreIncomingClipboardText(clipText) {
+            return
+        }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(clipText, forType: .string)
+        lastClipboardChangeCount = NSPasteboard.general.changeCount
+        lastClipboardReceivedText = clipText
+        lastClipboardReceivedAt = Date()
+    }
+
+    private func shouldIgnoreOutgoingClipboardText(_ text: String) -> Bool {
+        let now = Date()
+        if text == lastClipboardReceivedText, now.timeIntervalSince(lastClipboardReceivedAt) < clipboardDedupWindow {
+            return true
+        }
+        if text == lastClipboardSentText, now.timeIntervalSince(lastClipboardSentAt) < clipboardDedupWindow {
+            return true
+        }
+        return false
+    }
+
+    private func shouldIgnoreIncomingClipboardText(_ clipText: String) -> Bool {
+        let now = Date()
+
+        if clipText == lastClipboardSentText, now.timeIntervalSince(lastClipboardSentAt) < clipboardDedupWindow {
+            lastClipboardReceivedText = clipText
+            lastClipboardReceivedAt = now
+            lastClipboardChangeCount = NSPasteboard.general.changeCount
+            return true
+        }
+
+        if clipText == lastClipboardReceivedText, now.timeIntervalSince(lastClipboardReceivedAt) < clipboardDedupWindow {
+            return true
+        }
+
+        if NSPasteboard.general.string(forType: .string) == clipText {
+            lastClipboardReceivedText = clipText
+            lastClipboardReceivedAt = now
+            lastClipboardChangeCount = NSPasteboard.general.changeCount
+            return true
+        }
+
+        return false
     }
     
     private func sendClipboardPayload(_ payload: String) {
@@ -270,6 +360,82 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
                 peripheral.writeValue(data, for: char, type: .withResponse)
             }
         }
+    }
+
+    private func sendLocalCapability(reason: String) {
+        guard Date().timeIntervalSince(lastCapabilitySentAt) > 2 else { return }
+        lastCapabilitySentAt = Date()
+        sendControlPayload(localCapabilityPayload)
+        logDebug("\(reason)，已发送能力信息")
+    }
+
+    private func sendControlPayload(_ payload: String) {
+        guard let data = payload.data(using: .utf8) else { return }
+
+        if let dataChar = gattCharacteristic {
+            peripheralManager.updateValue(data, for: dataChar, onSubscribedCentrals: subscribedCentrals)
+        }
+
+        for (id, peripheral) in connectedPeripherals {
+            if let char = controlCharacteristics[id] {
+                peripheral.writeValue(data, for: char, type: .withResponse)
+            }
+        }
+    }
+
+    private func handleCapabilityPayload(_ payload: String) {
+        let parts = payload.components(separatedBy: "|")
+        guard parts.count >= 6 else { return }
+        let port = Int(parts[4])
+        let device = UdpDevice(
+            deviceName: parts[1],
+            role: "Peer",
+            hash_: parts[2],
+            ip: parts[3].isEmpty ? nil : parts[3],
+            filePort: port,
+            deviceType: parts[5].isEmpty ? "Unknown" : parts[5]
+        )
+        DispatchQueue.main.async {
+            self.udpDevices.removeAll { $0.hash_ == device.hash_ }
+            self.udpDevices.append(device)
+        }
+        logDebug("收到 BLE 能力信息: \(device.deviceName) \(device.ip ?? "-"):\(device.filePort.map(String.init) ?? "-")")
+    }
+
+    private func localIPv4Address() -> String? {
+        var interfaces: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfaces) == 0, let first = interfaces else {
+            return nil
+        }
+        defer { freeifaddrs(interfaces) }
+
+        let ignoredPrefixes = ["lo", "utun", "awdl", "llw", "bridge", "feth", "gif", "stf"]
+        var cursor: UnsafeMutablePointer<ifaddrs>? = first
+        while let current = cursor {
+            defer { cursor = current.pointee.ifa_next }
+            let name = String(cString: current.pointee.ifa_name)
+            if ignoredPrefixes.contains(where: { name.hasPrefix($0) }) {
+                continue
+            }
+            guard let address = current.pointee.ifa_addr,
+                  address.pointee.sa_family == UInt8(AF_INET) else {
+                continue
+            }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = getnameinfo(
+                address,
+                socklen_t(address.pointee.sa_len),
+                &host,
+                socklen_t(host.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            )
+            if result == 0 {
+                return String(cString: host)
+            }
+        }
+        return nil
     }
 
     // MARK: - Receiver (Central)
@@ -304,6 +470,19 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
                 self.debugLogs.removeLast()
             }
         }
+    }
+
+    private func showFileTransferNotification(_ status: LanFileTransferManager.TransferStatus) {
+        let content = UNMutableNotificationContent()
+        content.title = status.phase == .success ? (status.direction == .sending ? "文件发送成功" : "文件接收成功") : (status.direction == .sending ? "文件发送失败" : "文件接收失败")
+        content.body = status.fileName
+        content.sound = .default
+        let request = UNNotificationRequest(
+            identifier: "file-transfer-\(status.fileName)-\(Date().timeIntervalSince1970)",
+            content: content,
+            trigger: nil
+        )
+        UNUserNotificationCenter.current().add(request)
     }
     
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
@@ -471,6 +650,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
             for char in characteristics {
                 if char.uuid == handshakeCharUuid {
                     logDebug("发现握手特征，发送Mac名称...")
+                    controlCharacteristics[peripheral.identifier] = char
                     let macName = Host.current().localizedName ?? "Mac"
                     if let data = macName.data(using: .utf8) {
                         peripheral.writeValue(data, for: char, type: .withResponse)
@@ -479,6 +659,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
                     logDebug("发现数据特征，订阅通知...")
                     peripheral.setNotifyValue(true, for: char)
                     updateState(name: "Transferring", desc: "通道建立成功，等待消息...")
+                    sendLocalCapability(reason: "BLE 通道建立")
                 }
             }
         }
@@ -511,9 +692,9 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
                         DispatchQueue.main.async {
                             if msg.hasPrefix("CLIP|") {
                                 let clipText = String(msg.dropFirst(5))
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(clipText, forType: .string)
-                                self.lastClipboardChangeCount = NSPasteboard.general.changeCount
+                                self.applyIncomingClipboardText(clipText)
+                            } else if msg.hasPrefix("CAP|") {
+                                self.handleCapabilityPayload(msg)
                             } else {
                                 self.receivedMessage = msg
                                 let hash = self.peripheralHashes[peripheral.identifier] ?? "unknown"

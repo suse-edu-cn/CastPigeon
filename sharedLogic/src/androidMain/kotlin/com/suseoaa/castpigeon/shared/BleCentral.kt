@@ -176,4 +176,11 @@ actual class BleCentral actual constructor() {
     actual fun disconnect() {
         bluetoothGatt?.disconnect()
     }
+
+    actual fun sendMessage(payload: String): Boolean {
+        val gatt = bluetoothGatt ?: return false
+        val characteristic = gatt.getService(serviceUuid)?.getCharacteristic(handshakeCharUuid) ?: return false
+        characteristic.value = payload.toByteArray()
+        return gatt.writeCharacteristic(characteristic)
+    }
 }

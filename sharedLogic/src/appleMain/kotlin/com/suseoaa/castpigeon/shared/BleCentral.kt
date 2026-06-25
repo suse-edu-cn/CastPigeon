@@ -10,5 +10,6 @@ actual class BleCentral actual constructor() {
     actual fun startScanning(workMode: WorkMode, targetHashes: Set<ByteArray>?, onStateChange: (ConnectionState, String?) -> Unit) {}
     actual fun stopScanning() {}
     actual fun disconnect() {}
+    actual fun sendMessage(payload: String): Boolean = false
     actual var onMessageReceived: ((String) -> Unit)? = null
 }

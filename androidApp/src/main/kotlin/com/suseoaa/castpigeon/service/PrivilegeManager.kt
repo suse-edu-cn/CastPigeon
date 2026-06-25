@@ -2,14 +2,11 @@ package com.suseoaa.castpigeon.service
 
 import android.content.ComponentName
 import android.content.Context
-import android.content.Intent
 import android.content.ServiceConnection
 import android.content.SharedPreferences
 import android.os.IBinder
 import android.util.Log
 import com.suseoaa.castpigeon.IRootClipboard
-import com.topjohnwu.superuser.Shell
-import com.topjohnwu.superuser.ipc.RootService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -18,8 +15,12 @@ import rikka.shizuku.Shizuku
 
 enum class PrivilegeMode {
     DEFAULT, // 默认模式，无后台提权
-    ROOT,    // Root 模式
     SHIZUKU  // Shizuku 模式
+}
+
+enum class ActivePrivilegeBackend {
+    NONE,
+    SHIZUKU
 }
 
 object PrivilegeManager {
@@ -28,6 +29,7 @@ object PrivilegeManager {
     val privilegeMode = MutableStateFlow(PrivilegeMode.DEFAULT)
     val isPrivileged = MutableStateFlow(false)
     val bindStatus = MutableStateFlow<BindStatus>(BindStatus.Idle)
+    val activeBackend = MutableStateFlow(ActivePrivilegeBackend.NONE)
 
     // 共享的特权剪贴板读写 Binder
     var privilegedClipboard: IRootClipboard? = null
@@ -36,38 +38,37 @@ object PrivilegeManager {
 
     private var prefs: SharedPreferences? = null
     private var applicationContext: Context? = null
-
-    // Root 服务连接器
-    private val rootConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            Log.i("CastPigeonRoot", "RootClipboardService 连接成功")
-            privilegedClipboard = IRootClipboard.Stub.asInterface(service)
-            isPrivileged.value = true
-            bindStatus.value = BindStatus.Connected
-        }
-
-        override fun onServiceDisconnected(name: ComponentName?) {
-            Log.i("CastPigeonRoot", "RootClipboardService 连接断开")
-            privilegedClipboard = null
-            isPrivileged.value = false
-            bindStatus.value = BindStatus.Idle
-        }
-    }
+    private var bindingTarget: PrivilegeMode = PrivilegeMode.DEFAULT
 
     // Shizuku 用户服务连接器
     private val shizukuConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             Log.i("CastPigeonRoot", "ShizukuClipboardService 连接成功")
-            privilegedClipboard = IRootClipboard.Stub.asInterface(service)
-            isPrivileged.value = true
-            bindStatus.value = BindStatus.Connected
+            synchronized(this@PrivilegeManager) {
+                if (bindingTarget != PrivilegeMode.SHIZUKU || privilegeMode.value != PrivilegeMode.SHIZUKU) {
+                    Log.w("CastPigeonRoot", "忽略过期的 Shizuku 连接，当前目标模式=$bindingTarget, 已选模式=${privilegeMode.value}")
+                    return
+                }
+                privilegedClipboard = IRootClipboard.Stub.asInterface(service)
+                activeBackend.value = ActivePrivilegeBackend.SHIZUKU
+                isPrivileged.value = true
+                bindStatus.value = BindStatus.Connected
+            }
+            validateClipboardBackendAsync("Shizuku", ActivePrivilegeBackend.SHIZUKU)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             Log.i("CastPigeonRoot", "ShizukuClipboardService 连接断开")
-            privilegedClipboard = null
-            isPrivileged.value = false
-            bindStatus.value = BindStatus.Idle
+            synchronized(this@PrivilegeManager) {
+                if (activeBackend.value != ActivePrivilegeBackend.SHIZUKU &&
+                    bindingTarget != PrivilegeMode.SHIZUKU &&
+                    privilegeMode.value != PrivilegeMode.SHIZUKU
+                ) {
+                    Log.i("CastPigeonRoot", "忽略过期的 Shizuku 断开回调")
+                    return
+                }
+                clearRuntimeStateLocked(BindStatus.Idle)
+            }
         }
     }
 
@@ -90,8 +91,9 @@ object PrivilegeManager {
                 applicationContext?.let { executeShizukuCommand(it) }
             } else {
                 Log.w("CastPigeonRoot", "Shizuku 权限被拒绝")
-                bindStatus.value = BindStatus.Failed
-                isPrivileged.value = false
+                synchronized(this@PrivilegeManager) {
+                    clearRuntimeStateLocked(BindStatus.Failed)
+                }
             }
         }
     }
@@ -102,6 +104,91 @@ object PrivilegeManager {
         val mode = privilegeMode.value
         if (mode == PrivilegeMode.SHIZUKU) {
             applicationContext?.let { executeShizukuCommand(it) }
+        }
+    }
+
+    private fun clearRuntimeStateLocked(status: BindStatus) {
+        privilegedClipboard = null
+        isPrivileged.value = false
+        activeBackend.value = ActivePrivilegeBackend.NONE
+        bindStatus.value = status
+        if (status != BindStatus.Binding) {
+            bindingTarget = PrivilegeMode.DEFAULT
+        }
+    }
+
+    private fun persistSelectedMode(mode: PrivilegeMode) {
+        prefs?.edit()?.putString("privilege_mode", mode.name)?.apply()
+    }
+
+    private fun teardownConnectionsLocked(clearSelectedMode: Boolean) {
+        applicationContext?.let { ctx ->
+            try {
+                val serviceArgs = getShizukuArgs(ctx)
+                Shizuku.unbindUserService(serviceArgs, shizukuConnection, true)
+            } catch (_: Exception) { }
+        }
+
+        privilegedClipboard = null
+        isPrivileged.value = false
+        activeBackend.value = ActivePrivilegeBackend.NONE
+        bindStatus.value = BindStatus.Idle
+        bindingTarget = PrivilegeMode.DEFAULT
+
+        if (clearSelectedMode) {
+            privilegeMode.value = PrivilegeMode.DEFAULT
+            persistSelectedMode(PrivilegeMode.DEFAULT)
+        }
+    }
+
+    private fun prepareBinding(target: PrivilegeMode): Boolean {
+        synchronized(this) {
+            val targetBackend = when (target) {
+                PrivilegeMode.SHIZUKU -> ActivePrivilegeBackend.SHIZUKU
+                PrivilegeMode.DEFAULT -> ActivePrivilegeBackend.NONE
+            }
+
+            if (bindStatus.value == BindStatus.Connected &&
+                activeBackend.value == targetBackend &&
+                privilegedClipboard != null &&
+                privilegeMode.value == target
+            ) {
+                Log.i("CastPigeonRoot", "$target 已处于生效状态，跳过重复绑定")
+                return false
+            }
+
+            if (bindStatus.value == BindStatus.Binding && bindingTarget == target) {
+                Log.i("CastPigeonRoot", "$target 正在绑定中，跳过重复请求")
+                return false
+            }
+
+            teardownConnectionsLocked(clearSelectedMode = false)
+            privilegeMode.value = target
+            persistSelectedMode(target)
+            bindingTarget = target
+            bindStatus.value = BindStatus.Binding
+            return true
+        }
+    }
+
+    private fun validateClipboardBackendAsync(label: String, backend: ActivePrivilegeBackend) {
+        CoroutineScope(Dispatchers.IO).launch {
+            val clipboard = synchronized(this@PrivilegeManager) {
+                if (activeBackend.value != backend) return@launch
+                privilegedClipboard
+            } ?: return@launch
+
+            try {
+                clipboard.getClipboardText()
+                Log.i("CastPigeonRoot", "$label 后端连通性校验通过，实际生效后端=${activeBackend.value}")
+            } catch (e: Exception) {
+                Log.e("CastPigeonRoot", "$label 后端连通性校验失败", e)
+                synchronized(this@PrivilegeManager) {
+                    if (activeBackend.value == backend) {
+                        clearRuntimeStateLocked(BindStatus.Failed)
+                    }
+                }
+            }
         }
     }
 
@@ -132,12 +219,7 @@ object PrivilegeManager {
         privilegeMode.value = mode
 
         // 根据上次保存的模式自动连接
-        if (mode == PrivilegeMode.ROOT) {
-            Log.i("CastPigeonRoot", "上次开启了 Root 模式，尝试自动提权...")
-            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                executeAppOpsCommand(context)
-            }, 500)
-        } else if (mode == PrivilegeMode.SHIZUKU) {
+        if (mode == PrivilegeMode.SHIZUKU) {
             Log.i("CastPigeonRoot", "上次开启了 Shizuku 模式，尝试自动提权...")
             if (Shizuku.pingBinder()) {
                 executeShizukuCommand(context)
@@ -149,78 +231,9 @@ object PrivilegeManager {
 
     fun disable() {
         Log.i("CastPigeonRoot", "禁用后台提权模式...")
-        
-        // 尝试解绑 Root 服务
-        try {
-            RootService.unbind(rootConnection)
-        } catch (e: Exception) {}
-        
-        // 尝试解绑 Shizuku 服务
-        applicationContext?.let { ctx ->
-            try {
-                val serviceArgs = getShizukuArgs(ctx)
-                Shizuku.unbindUserService(serviceArgs, shizukuConnection, true)
-            } catch (e: Exception) {}
+        synchronized(this) {
+            teardownConnectionsLocked(clearSelectedMode = true)
         }
-
-        privilegedClipboard = null
-        isPrivileged.value = false
-        bindStatus.value = BindStatus.Idle
-        privilegeMode.value = PrivilegeMode.DEFAULT
-        prefs?.edit()?.putString("privilege_mode", PrivilegeMode.DEFAULT.name)?.apply()
-    }
-
-    /**
-     * 执行 Root 提权授权，并绑定 Root 守护进程
-     */
-    fun executeAppOpsCommand(context: Context): Boolean {
-        if (bindStatus.value == BindStatus.Binding) {
-            Log.w("CastPigeonRoot", "已在绑定中，跳过重复绑定")
-            return true
-        }
-
-        bindStatus.value = BindStatus.Binding
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                // 诊断：看 su 是否可用
-                val suTest = Shell.cmd("id").exec()
-                if (!suTest.isSuccess) {
-                    Log.w("CastPigeonRoot", "Root 不可用，su 执行失败")
-                    bindStatus.value = BindStatus.Failed
-                    isPrivileged.value = false
-                    return@launch
-                }
-
-                Log.i("CastPigeonRoot", "Root 可用: out=${suTest.out}")
-
-                // AppOps 是普通进程读取兜底，不作为 Root 模式可用性的唯一判断。
-                val result = Shell.cmd("appops set com.suseoaa.castpigeon READ_CLIPBOARD allow").exec()
-                if (result.isSuccess) {
-                    Log.i("CastPigeonRoot", "Root AppOps 提权命令执行成功")
-                } else {
-                    Log.w("CastPigeonRoot", "Root AppOps 提权命令失败，继续绑定 RootClipboardService: ${result.err}")
-                }
-
-                privilegeMode.value = PrivilegeMode.ROOT
-                prefs?.edit()?.putString("privilege_mode", PrivilegeMode.ROOT.name)?.apply()
-
-                android.os.Handler(android.os.Looper.getMainLooper()).post {
-                    try {
-                        val intent = Intent(context, RootClipboardService::class.java)
-                        RootService.bind(intent, rootConnection)
-                    } catch (e: Exception) {
-                        Log.e("CastPigeonRoot", "绑定 RootClipboardService 失败", e)
-                        bindStatus.value = BindStatus.Failed
-                        isPrivileged.value = false
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e("CastPigeonRoot", "执行 Root 提权发生异常", e)
-                bindStatus.value = BindStatus.Failed
-                isPrivileged.value = false
-            }
-        }
-        return true
     }
 
     /**
@@ -229,23 +242,21 @@ object PrivilegeManager {
     fun executeShizukuCommand(context: Context): Boolean {
         if (!Shizuku.pingBinder()) {
             Log.w("CastPigeonRoot", "Shizuku 服务未运行")
-            bindStatus.value = BindStatus.Failed
-            isPrivileged.value = false
+            synchronized(this) {
+                clearRuntimeStateLocked(BindStatus.Failed)
+            }
             return false
         }
 
         if (Shizuku.checkSelfPermission() != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             Log.w("CastPigeonRoot", "未获得 Shizuku 权限")
-            bindStatus.value = BindStatus.Failed
-            isPrivileged.value = false
+            synchronized(this) {
+                clearRuntimeStateLocked(BindStatus.Failed)
+            }
             return false
         }
 
-        if (bindStatus.value == BindStatus.Binding) {
-            return true
-        }
-
-        bindStatus.value = BindStatus.Binding
+        if (!prepareBinding(PrivilegeMode.SHIZUKU)) return true
         CoroutineScope(Dispatchers.IO).launch {
             try {
                 val process = shizukuNewProcess(arrayOf(
@@ -254,28 +265,35 @@ object PrivilegeManager {
                 val exitCode = process.waitFor()
                 if (exitCode == 0) {
                     Log.i("CastPigeonRoot", "Shizuku AppOps 提权成功，开始绑定 ShizukuClipboardService")
-                    privilegeMode.value = PrivilegeMode.SHIZUKU
-                    prefs?.edit()?.putString("privilege_mode", PrivilegeMode.SHIZUKU.name)?.apply()
-                    
+
                     android.os.Handler(android.os.Looper.getMainLooper()).post {
                         try {
+                            synchronized(this@PrivilegeManager) {
+                                if (bindingTarget != PrivilegeMode.SHIZUKU || privilegeMode.value != PrivilegeMode.SHIZUKU) {
+                                    Log.w("CastPigeonRoot", "Shizuku 绑定前检测到目标模式已变化，取消本次绑定")
+                                    return@post
+                                }
+                            }
                             val serviceArgs = getShizukuArgs(context)
                             Shizuku.bindUserService(serviceArgs, shizukuConnection)
                         } catch (e: Exception) {
                             Log.e("CastPigeonRoot", "绑定 Shizuku 用户服务失败", e)
-                            bindStatus.value = BindStatus.Failed
-                            isPrivileged.value = false
+                            synchronized(this@PrivilegeManager) {
+                                clearRuntimeStateLocked(BindStatus.Failed)
+                            }
                         }
                     }
                 } else {
                     Log.e("CastPigeonRoot", "Shizuku AppOps 提权失败，退出码: $exitCode")
-                    bindStatus.value = BindStatus.Failed
-                    isPrivileged.value = false
+                    synchronized(this@PrivilegeManager) {
+                        clearRuntimeStateLocked(BindStatus.Failed)
+                    }
                 }
             } catch (e: Exception) {
                 Log.e("CastPigeonRoot", "Shizuku AppOps 提权异常", e)
-                bindStatus.value = BindStatus.Failed
-                isPrivileged.value = false
+                synchronized(this@PrivilegeManager) {
+                    clearRuntimeStateLocked(BindStatus.Failed)
+                }
             }
         }
         return true
@@ -301,17 +319,6 @@ object PrivilegeManager {
         }
         
         when (mode) {
-            PrivilegeMode.ROOT -> {
-                CoroutineScope(Dispatchers.IO).launch {
-                    try {
-                        val result = Shell.cmd("am start -n com.suseoaa.castpigeon/.ui.TransparentClipboardActivity --activity-no-animation -a ACTION_SYNC_CLIPBOARD_AUTO").exec()
-                        Log.i("CastPigeonRoot", "Root 启动 Activity 结果: success=${result.isSuccess}")
-                    } catch (e: Exception) {
-                        Log.e("CastPigeonRoot", "Root 启动 Activity 异常", e)
-                    }
-                }
-                return true
-            }
             PrivilegeMode.SHIZUKU -> {
                 if (Shizuku.pingBinder() && Shizuku.checkSelfPermission() == android.content.pm.PackageManager.PERMISSION_GRANTED) {
                     CoroutineScope(Dispatchers.IO).launch {

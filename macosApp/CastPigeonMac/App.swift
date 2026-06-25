@@ -338,6 +338,98 @@ struct DevicesView: View {
                 }
             }
             .padding(.horizontal, 40)
+
+            VStack(alignment: .leading, spacing: 12) {
+                Text("局域网在线设备")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.secondary)
+
+                if let transfer = viewModel.fileTransferStatus {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text({
+                            switch transfer.phase {
+                            case .inProgress:
+                                return transfer.direction == .sending ? "正在发送文件" : "正在接收文件"
+                            case .success:
+                                return transfer.direction == .sending ? "发送成功" : "接收成功"
+                            case .failed:
+                                return transfer.direction == .sending ? "发送失败" : "接收失败"
+                            }
+                        }())
+                        .font(.system(size: 14, weight: .semibold))
+                        Text(transfer.fileName)
+                            .font(.system(size: 13))
+                        Text(transfer.peerLabel)
+                            .font(.system(size: 12))
+                            .foregroundColor(.secondary)
+                        if transfer.phase == .inProgress {
+                            if let progress = transfer.progressFraction {
+                                ProgressView(value: progress)
+                                Text("\(Int(progress * 100))%")
+                                    .font(.system(size: 12))
+                                    .foregroundColor(.secondary)
+                            } else {
+                                ProgressView()
+                            }
+                        } else if let detail = transfer.detail, !detail.isEmpty {
+                            Text(detail)
+                                .font(.system(size: 12))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding()
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
+                    .cornerRadius(12)
+                }
+
+                if viewModel.udpDevices.isEmpty {
+                    Text("暂无局域网设备。启动工作或配对模式后会自动发现。")
+                        .font(.system(size: 14))
+                        .foregroundColor(.secondary)
+                        .padding()
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
+                        .cornerRadius(12)
+                } else {
+                    ScrollView {
+                        VStack(spacing: 12) {
+                            ForEach(viewModel.udpDevices, id: \.self) { device in
+                                HStack {
+                                    Image(systemName: device.deviceType == "Mac" ? "desktopcomputer" : "iphone")
+                                        .font(.system(size: 24))
+                                        .foregroundColor(.blue)
+                                    VStack(alignment: .leading) {
+                                        Text(device.deviceName)
+                                            .font(.system(size: 15, weight: .semibold))
+                                        Text("\(device.deviceType) · \(device.ip ?? "unknown") · 文件端口: \(device.filePort.map(String.init) ?? "不可用")")
+                                            .font(.system(size: 12))
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    Button("发送文件") {
+                                        let panel = NSOpenPanel()
+                                        panel.canChooseFiles = true
+                                        panel.canChooseDirectories = false
+                                        panel.allowsMultipleSelection = false
+                                        if panel.runModal() == .OK, let url = panel.url {
+                                            LanFileTransferManager.shared.sendFile(fileURL: url, to: device) { success in
+                                                viewModel.logDebug(success ? "文件已发送给 \(device.deviceName)" : "文件发送失败: \(device.deviceName)")
+                                            }
+                                        }
+                                    }
+                                    .disabled(device.filePort == nil || device.ip == nil)
+                                }
+                                .padding()
+                                .background(Color(NSColor.controlBackgroundColor).opacity(0.6))
+                                .cornerRadius(12)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 220)
+                }
+            }
+            .padding(.horizontal, 40)
             
             Spacer()
         }

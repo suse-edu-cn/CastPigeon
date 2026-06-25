@@ -2,7 +2,10 @@
 package com.suseoaa.castpigeon.ui
 
 import android.content.Context
+import android.net.Uri
 import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
@@ -36,6 +39,7 @@ import com.suseoaa.castpigeon.StartupPermissionCoordinator
 import com.suseoaa.castpigeon.shared.crypto.Crypto
 import kotlinx.serialization.encodeToString
 import com.suseoaa.castpigeon.service.AppConnectionManager
+import com.suseoaa.castpigeon.service.LanFileTransferManager
 import androidx.core.content.edit
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import dev.chrisbanes.haze.HazeState
@@ -338,6 +342,26 @@ fun DashboardContent(
     hazeState: dev.chrisbanes.haze.HazeState
 ) {
     val receivedMockMessage by AppConnectionManager.lastReceivedMessage.collectAsState()
+    val context = LocalContext.current
+    val transferStatus by LanFileTransferManager.transferStatus.collectAsState()
+    var fileTargetDevice by remember { mutableStateOf<UdpDevice?>(null) }
+    val filePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        val device = fileTargetDevice
+        val port = device?.filePort
+        if (uri != null && device != null && port != null) {
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {
+                val success = LanFileTransferManager.sendFile(context, device.ipAddress, port, uri)
+                android.widget.Toast.makeText(
+                    context,
+                    if (success) "文件已发送给 ${device.deviceName}" else "文件发送失败",
+                    android.widget.Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+        fileTargetDevice = null
+    }
     val isSystemDark = androidx.compose.foundation.isSystemInDarkTheme()
     
     val infiniteTransition = rememberInfiniteTransition(label = "breathing")
@@ -439,8 +463,42 @@ fun DashboardContent(
 
         Spacer(modifier = Modifier.height(24.dp))
 
-        if (workMode == WorkMode.Pairing) {
-            val udpDevices by UdpDiscovery.discoveredDevices.collectAsState()
+        transferStatus?.let { status ->
+            ElevatedCard(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(modifier = Modifier.padding(16.dp).fillMaxWidth()) {
+                    val phaseText = when (status.phase) {
+                        LanFileTransferManager.TransferPhase.InProgress -> if (status.direction == LanFileTransferManager.TransferDirection.Sending) "正在发送文件" else "正在接收文件"
+                        LanFileTransferManager.TransferPhase.Success -> if (status.direction == LanFileTransferManager.TransferDirection.Sending) "发送成功" else "接收成功"
+                        LanFileTransferManager.TransferPhase.Failed -> if (status.direction == LanFileTransferManager.TransferDirection.Sending) "发送失败" else "接收失败"
+                    }
+                    Text(phaseText, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(status.fileName, fontSize = 13.sp)
+                    Text(status.peerLabel, fontSize = 12.sp, color = Color.Gray)
+                    if (status.phase == LanFileTransferManager.TransferPhase.InProgress) {
+                        Spacer(modifier = Modifier.height(10.dp))
+                        val progress = status.progressFraction
+                        if (progress != null) {
+                            LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text("${(progress * 100).toInt()}%", fontSize = 12.sp, color = Color.Gray)
+                        } else {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
+                    } else if (!status.detail.isNullOrBlank()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(status.detail, fontSize = 12.sp, color = Color.Gray)
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
+        val udpDevices by UdpDiscovery.discoveredDevices.collectAsState()
+        if (workMode == WorkMode.Pairing || udpDevices.isNotEmpty()) {
             Text("在线设备", fontSize = 16.sp, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.Start))
             Spacer(modifier = Modifier.height(8.dp))
             if (udpDevices.isNotEmpty()) {
@@ -452,16 +510,26 @@ fun DashboardContent(
                                 UdpDiscovery.requestBinding(device.hash, device.deviceName, role.name, device.ipAddress)
                             }
                         ) {
-                            Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                                Column {
-                                    Text(device.deviceName, fontWeight = FontWeight.Bold)
-                                    Text("IP: ${device.ipAddress}", fontSize = 12.sp, color = Color.Gray)
-                                }
-                                Icon(Icons.Default.Computer, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                            }
-                        }
-                    }
-                }
+	                            Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+	                                Column {
+	                                    Text(device.deviceName, fontWeight = FontWeight.Bold)
+	                                    Text("${device.deviceType} · IP: ${device.ipAddress} · 文件端口: ${device.filePort ?: "不可用"}", fontSize = 12.sp, color = Color.Gray)
+	                                }
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        if (device.filePort != null) {
+                                            TextButton(onClick = {
+                                                fileTargetDevice = device
+                                                filePickerLauncher.launch("*/*")
+                                            }) {
+                                                Text("发送文件")
+                                            }
+                                        }
+                                        Icon(Icons.Default.Computer, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                                    }
+	                            }
+	                        }
+	                    }
+	                }
             } else {
                 Box(modifier = Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator()
@@ -508,6 +576,9 @@ fun SettingsContent() {
     val apps by AppManager.appList.collectAsState()
     val context = LocalContext.current
     val isPrivileged by com.suseoaa.castpigeon.service.PrivilegeManager.isPrivileged.collectAsState()
+    val activeBackend by com.suseoaa.castpigeon.service.PrivilegeManager.activeBackend.collectAsState()
+    val bindStatus by com.suseoaa.castpigeon.service.PrivilegeManager.bindStatus.collectAsState()
+    val privilegeMode by com.suseoaa.castpigeon.service.PrivilegeManager.privilegeMode.collectAsState()
     
     Column(modifier = Modifier.fillMaxSize()) {
         Box(modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(horizontal = 24.dp, vertical = 16.dp)) {
@@ -533,19 +604,8 @@ fun SettingsContent() {
                                     )
                                 }
                             }
-                            val bindStatus by com.suseoaa.castpigeon.service.PrivilegeManager.bindStatus.collectAsState()
-                            val privilegeMode by com.suseoaa.castpigeon.service.PrivilegeManager.privilegeMode.collectAsState()
-                            
                             val statusText = when (privilegeMode) {
                                 com.suseoaa.castpigeon.service.PrivilegeMode.DEFAULT -> "未开启后台提权同步"
-                                com.suseoaa.castpigeon.service.PrivilegeMode.ROOT -> {
-                                    when (bindStatus) {
-                                        com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Binding -> "正在获取 Root 权限…"
-                                        com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Connected -> "Root 提权已生效"
-                                        com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Failed -> "Root 授权失败"
-                                        else -> "已选择 Root 模式"
-                                    }
-                                }
                                 com.suseoaa.castpigeon.service.PrivilegeMode.SHIZUKU -> {
                                     when (bindStatus) {
                                         com.suseoaa.castpigeon.service.PrivilegeManager.BindStatus.Binding -> "正在连接 Shizuku…"
@@ -560,6 +620,16 @@ fun SettingsContent() {
                                 fontSize = 12.sp,
                                 color = if (isPrivileged) Color(0xFF4CAF50) else Color.Gray
                             )
+                            val backendText = when (activeBackend) {
+                                com.suseoaa.castpigeon.service.ActivePrivilegeBackend.NONE -> "当前实际后端：无"
+                                com.suseoaa.castpigeon.service.ActivePrivilegeBackend.SHIZUKU -> "当前实际后端：Shizuku"
+                            }
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = backendText,
+                                fontSize = 11.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
                         }
                     }
                     
@@ -568,11 +638,9 @@ fun SettingsContent() {
                     Spacer(modifier = Modifier.height(12.dp))
                     
                     // Segmented selection
-                    val privilegeMode by com.suseoaa.castpigeon.service.PrivilegeManager.privilegeMode.collectAsState()
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         val modes = listOf(
                             Triple(com.suseoaa.castpigeon.service.PrivilegeMode.DEFAULT, "默认", Icons.Default.Close),
-                            Triple(com.suseoaa.castpigeon.service.PrivilegeMode.ROOT, "Root", Icons.Default.Android),
                             Triple(com.suseoaa.castpigeon.service.PrivilegeMode.SHIZUKU, "Shizuku", Icons.Default.Build)
                         )
                         
@@ -583,11 +651,6 @@ fun SettingsContent() {
                                     if (mode == com.suseoaa.castpigeon.service.PrivilegeMode.DEFAULT) {
                                         com.suseoaa.castpigeon.service.PrivilegeManager.disable()
                                         android.widget.Toast.makeText(context, "已切换为默认模式", android.widget.Toast.LENGTH_SHORT).show()
-                                    } else if (mode == com.suseoaa.castpigeon.service.PrivilegeMode.ROOT) {
-                                        val started = com.suseoaa.castpigeon.service.PrivilegeManager.executeAppOpsCommand(context)
-                                        if (started) {
-                                            android.widget.Toast.makeText(context, "正在获取 Root 权限…", android.widget.Toast.LENGTH_SHORT).show()
-                                        }
                                     } else if (mode == com.suseoaa.castpigeon.service.PrivilegeMode.SHIZUKU) {
                                         if (!rikka.shizuku.Shizuku.pingBinder()) {
                                             android.widget.Toast.makeText(context, "Shizuku 服务未运行！请先启动 Shizuku 应用程序", android.widget.Toast.LENGTH_LONG).show()
@@ -678,17 +741,13 @@ private fun startBluetoothAction(
 ) {
     stateMachine.setWorkMode(mode)
     stateMachine.transitionTo(ConnectionState.AdvertisingOrScanning)
+    val context = com.suseoaa.castpigeon.shared.BleContextHolder.applicationContext
+    val hashStr = deviceHash.joinToString("") { "%02X".format(it) }
+    val filePort = com.suseoaa.castpigeon.service.LanFileTransferManager.serverPort.value
+    UdpDiscovery.startBroadcasting(role.name, androidName, hashStr, filePort, "Android")
     
-    if (mode == WorkMode.Pairing) {
-        val hashStr = deviceHash.joinToString("") { "%02X".format(it) }
-        if (role == DeviceRole.Sender) {
-            UdpDiscovery.startBroadcasting(role.name, androidName, hashStr)
-        } else {
-            UdpDiscovery.startListening()
-        }
-    } else {
+    if (mode == WorkMode.Working) {
         // 启动前台服务
-        val context = com.suseoaa.castpigeon.shared.BleContextHolder.applicationContext
         if (context != null) {
             com.suseoaa.castpigeon.service.BleForegroundService.start(context)
         }

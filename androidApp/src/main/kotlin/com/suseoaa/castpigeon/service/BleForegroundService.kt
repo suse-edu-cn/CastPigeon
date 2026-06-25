@@ -14,6 +14,8 @@ import com.suseoaa.castpigeon.shared.ConnectionState
 import com.suseoaa.castpigeon.shared.DeviceRole
 import com.suseoaa.castpigeon.shared.NotificationRepository
 import com.suseoaa.castpigeon.shared.WorkMode
+import com.suseoaa.castpigeon.shared.network.UdpDevice
+import com.suseoaa.castpigeon.shared.network.UdpDiscovery
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -25,8 +27,12 @@ import android.content.IntentFilter
 import android.content.ClipboardManager
 import android.content.ClipData
 import android.content.ClipboardManager.OnPrimaryClipChangedListener
+import android.net.ConnectivityManager
+import android.net.LinkAddress
+import android.net.NetworkCapabilities
 import android.widget.Toast
 import com.suseoaa.castpigeon.IClipboardChangeCallback
+import java.net.Inet4Address
 
 class BleForegroundService : Service() {
 
@@ -53,12 +59,14 @@ class BleForegroundService : Service() {
     private var lastListenerTriggerTime = 0L
     private var registeredPrivilegedClipboard: com.suseoaa.castpigeon.IRootClipboard? = null
     private var pendingClipboardTextForMac: String? = null
+    private var lastCapabilitySentAt = 0L
 
     private val privilegedClipboardCallback = object : IClipboardChangeCallback.Stub() {
         override fun onClipboardChanged(text: String?) {
             if (text.isNullOrEmpty() || text == lastSyncedText) return
-            android.util.Log.i("CastPigeon", "收到 Shizuku 剪贴板变化回调，准备发送到 Mac")
-            sendClipboardTextToMac(text, "Shizuku 剪贴板监听")
+            val backend = PrivilegeManager.activeBackend.value
+            android.util.Log.i("CastPigeon", "收到特权剪贴板变化回调，来源=$backend，准备发送到 Mac")
+            sendClipboardTextToMac(text, "$backend 剪贴板监听")
         }
     }
 
@@ -135,10 +143,10 @@ class BleForegroundService : Service() {
         try {
             clipboard.registerClipboardCallback(privilegedClipboardCallback)
             registeredPrivilegedClipboard = clipboard
-            android.util.Log.i("CastPigeon", "已注册 Shizuku/Root 剪贴板变化回调")
+            android.util.Log.i("CastPigeon", "已注册特权剪贴板变化回调，实际后端=${PrivilegeManager.activeBackend.value}")
         } catch (e: Exception) {
             registeredPrivilegedClipboard = null
-            android.util.Log.e("CastPigeon", "注册 Shizuku/Root 剪贴板变化回调失败", e)
+            android.util.Log.e("CastPigeon", "注册 Shizuku 剪贴板变化回调失败", e)
         }
     }
 
@@ -187,7 +195,7 @@ class BleForegroundService : Service() {
         if (PrivilegeManager.isPrivileged.value && PrivilegeManager.privilegedClipboard != null) {
             try {
                 text = PrivilegeManager.privilegedClipboard?.getClipboardText()
-                android.util.Log.i("CastPigeon", "通过特权服务读取剪贴板成功: $text")
+                android.util.Log.i("CastPigeon", "通过特权服务读取剪贴板成功: $text, backend=${PrivilegeManager.activeBackend.value}")
             } catch (e: Exception) {
                 android.util.Log.e("CastPigeon", "通过特权服务读取剪贴板失败", e)
             }
@@ -215,22 +223,6 @@ class BleForegroundService : Service() {
     private val clipboardSyncReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             android.util.Log.i("CastPigeon", "收到广播: ${intent?.action}")
-            if (intent?.action == "com.suseoaa.castpigeon.ROOT_CLIPBOARD_CHANGED") {
-                val text = intent.getStringExtra("text")
-                if (!text.isNullOrEmpty() && text != lastSyncedText) {
-                    lastSyncedText = text
-                    val payload = "CLIP|$text"
-                    android.util.Log.i("CastPigeon", "收到 Root 守护进程剪贴板更新，准备发送: $payload")
-                    try {
-                        AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
-                        android.util.Log.i("CastPigeon", "自动发送剪贴板到 Mac 成功！")
-                    } catch (e: Exception) {
-                        android.util.Log.e("CastPigeon", "自动发送剪贴板失败", e)
-                    }
-                }
-                return
-            }
-
             if (intent?.action == "com.suseoaa.castpigeon.ACTION_SYNC_CLIPBOARD") {
                 android.util.Log.i("CastPigeon", "准备读取剪贴板并发送")
                 
@@ -285,7 +277,7 @@ class BleForegroundService : Service() {
                 
                 if (!success) {
                     android.util.Log.e("CastPigeon", "ACTION_COPY_CLIPBOARD 直接写入剪贴板失败，未拉起空白页面")
-                    Toast.makeText(this@BleForegroundService, "复制失败，请检查 Shizuku/Root 权限", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@BleForegroundService, "复制失败，请检查 Shizuku 权限", Toast.LENGTH_SHORT).show()
                 }
                 
                 val id = intent.getIntExtra("EXTRA_NOTIF_ID", 1002)
@@ -303,7 +295,6 @@ class BleForegroundService : Service() {
         val filter = IntentFilter().apply {
             addAction("com.suseoaa.castpigeon.ACTION_SYNC_CLIPBOARD")
             addAction("com.suseoaa.castpigeon.ACTION_COPY_CLIPBOARD")
-            addAction("com.suseoaa.castpigeon.ROOT_CLIPBOARD_CHANGED")
         }
         if (Build.VERSION.SDK_INT >= 33) {
             registerReceiver(clipboardSyncReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -359,6 +350,11 @@ class BleForegroundService : Service() {
                 if (status == PrivilegeManager.BindStatus.Connected) {
                     registerPrivilegedClipboardCallbackIfNeeded()
                 } else {
+                    try {
+                        registeredPrivilegedClipboard?.unregisterClipboardCallback(privilegedClipboardCallback)
+                    } catch (e: Exception) {
+                        android.util.Log.w("CastPigeon", "注销失效的特权剪贴板回调失败", e)
+                    }
                     registeredPrivilegedClipboard = null
                 }
             }
@@ -405,6 +401,9 @@ class BleForegroundService : Service() {
                     android.util.Log.e("CastPigeon", "收到 Mac 剪贴板但直接写入失败，未拉起空白页面")
                     showClipboardNotification(text)
                 }
+            } else if (msg.startsWith("CAP|")) {
+                handlePeerCapability(msg)
+                sendLocalCapabilityOverBle("收到对端能力信息后回送")
             } else {
                 AppConnectionManager.lastReceivedMessage.value = msg
             }
@@ -419,6 +418,7 @@ class BleForegroundService : Service() {
                 val role = AppConnectionManager.stateMachine.role.value
 
                 if (state == ConnectionState.Transferring) {
+                    sendLocalCapabilityOverBle("BLE 连接就绪")
                     flushPendingClipboardToMacIfReady("BLE 连接就绪")
                 }
                 
@@ -467,6 +467,76 @@ class BleForegroundService : Service() {
             
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notificationManager.notify(1002, notif)
+    }
+
+    private fun sendLocalCapabilityOverBle(reason: String) {
+        val now = System.currentTimeMillis()
+        if (now - lastCapabilitySentAt < 2_000) return
+        lastCapabilitySentAt = now
+
+        val ip = getLocalIpv4Address()
+        val filePort = LanFileTransferManager.serverPort.value
+        val deviceHash = getDeviceHash().joinToString("") { "%02X".format(it) }
+        val deviceName = android.provider.Settings.Global.getString(contentResolver, android.provider.Settings.Global.DEVICE_NAME)
+            ?: Build.MODEL
+            ?: "Android"
+        val payload = listOf("CAP", deviceName, deviceHash, ip.orEmpty(), filePort.toString(), "Android")
+            .joinToString("|")
+
+        try {
+            if (AppConnectionManager.stateMachine.role.value == DeviceRole.Sender) {
+                AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
+            } else {
+                AppConnectionManager.bleCentral.sendMessage(payload)
+            }
+            android.util.Log.i("CastPigeon", "$reason 已发送能力信息: $payload")
+        } catch (e: Exception) {
+            android.util.Log.e("CastPigeon", "$reason 发送能力信息失败", e)
+        }
+    }
+
+    private fun handlePeerCapability(payload: String) {
+        val parts = payload.split("|")
+        if (parts.size < 6) return
+        val deviceName = parts[1]
+        val hash = parts[2]
+        val ip = parts[3].takeIf { it.isNotBlank() } ?: return
+        val port = parts[4].toIntOrNull()
+        val deviceType = parts[5].ifBlank { "Unknown" }
+        UdpDiscovery.upsertDiscoveredDevice(
+            UdpDevice(
+                deviceName = deviceName,
+                role = "Peer",
+                hash = hash,
+                ipAddress = ip,
+                filePort = port,
+                deviceType = deviceType
+            )
+        )
+        android.util.Log.i("CastPigeon", "收到 BLE 能力信息并更新在线设备: $payload")
+    }
+
+    private fun getLocalIpv4Address(): String? {
+        val connectivityManager = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val networks = connectivityManager.allNetworks
+        val sortedNetworks = networks.sortedByDescending { network ->
+            val capabilities = connectivityManager.getNetworkCapabilities(network)
+            if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true) 1 else 0
+        }
+        for (network in sortedNetworks) {
+            val capabilities = connectivityManager.getNetworkCapabilities(network) ?: continue
+            if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+            val properties = connectivityManager.getLinkProperties(network) ?: continue
+            val interfaceName = properties.interfaceName.orEmpty()
+            if (listOf("tun", "utun", "rmnet", "lo").any { interfaceName.startsWith(it) }) continue
+            for (address: LinkAddress in properties.linkAddresses) {
+                val inetAddress = address.address
+                if (inetAddress is Inet4Address && !inetAddress.isLoopbackAddress) {
+                    return inetAddress.hostAddress
+                }
+            }
+        }
+        return null
     }
 
     private fun updateNotification() {

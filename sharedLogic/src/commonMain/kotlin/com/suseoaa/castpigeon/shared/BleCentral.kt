@@ -37,6 +37,11 @@ expect class BleCentral() {
     fun disconnect()
 
     /**
+     * 通过已连接 GATT 的写特征发送一条短控制消息。
+     */
+    fun sendMessage(payload: String): Boolean
+
+    /**
 *当接收到模拟消息或真实通知时的回调
 */
     var onMessageReceived: ((String) -> Unit)?

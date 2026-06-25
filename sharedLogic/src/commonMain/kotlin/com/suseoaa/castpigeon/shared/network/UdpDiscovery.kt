@@ -12,7 +12,9 @@ data class UdpDevice(
     val deviceName: String,
     val role: String,
     val hash: String,
-    val ipAddress: String
+    val ipAddress: String,
+    val filePort: Int? = null,
+    val deviceType: String = "Unknown"
 )
 
 data class PinDisplayInfo(
@@ -77,10 +79,14 @@ object UdpDiscovery {
                         val role = parts[1]
                         val name = parts[2]
                         val hash = parts[3]
-                        val ip = datagram.address.toString()
+                        val filePort = parts.getOrNull(4)?.toIntOrNull()?.takeIf { it > 0 }
+                        val deviceType = parts.getOrNull(5) ?: "Unknown"
+                        val ip = sanitizeEndpointAddress(datagram.address.toString())
                         
-                        val newDevice = UdpDevice(name, role, hash, ip)
-                        _discoveredDevices.update { it + newDevice }
+                        val newDevice = UdpDevice(name, role, hash, ip, filePort, deviceType)
+                        _discoveredDevices.update { devices ->
+                            devices.filterNot { it.hash == hash }.toSet() + newDevice
+                        }
                         
                     } else if (parts.size >= 5 && parts[0] == "CP_BIND_REQUEST") {
                         // CP_BIND_REQUEST|TargetHash|RequesterRole|RequesterName|RequesterHash
@@ -89,7 +95,7 @@ object UdpDiscovery {
                             val reqRole = parts[2]
                             val reqName = parts[3]
                             val reqHash = parts[4]
-                            val ip = datagram.address.toString()
+                            val ip = sanitizeEndpointAddress(datagram.address.toString())
                             val requestingDevice = UdpDevice(reqName, reqRole, reqHash, ip)
                             
                             // 收到绑定请求，生成随机 4 位 PIN
@@ -111,7 +117,7 @@ object UdpDiscovery {
                             val reqName = parts[3]
                             val reqHash = parts[4]
                             val receivedPin = parts[5]
-                            val ip = datagram.address.toString()
+                            val ip = sanitizeEndpointAddress(datagram.address.toString())
                             val requestingDevice = UdpDevice(reqName, reqRole, reqHash, ip)
                             
                             if (currentExpectedPin == receivedPin && currentPairingTargetHash == reqHash) {
@@ -153,8 +159,14 @@ object UdpDiscovery {
             }
         }
     }
+
+    fun upsertDiscoveredDevice(device: UdpDevice) {
+        _discoveredDevices.update { devices ->
+            devices.filterNot { it.hash == device.hash }.toSet() + device
+        }
+    }
     
-    fun startBroadcasting(role: String, deviceName: String, hash: String) {
+    fun startBroadcasting(role: String, deviceName: String, hash: String, filePort: Int? = null, deviceType: String = "Android") {
         if (broadcastingJob?.isActive == true) return
         myPairingHash = hash
         myRole = role
@@ -174,7 +186,8 @@ object UdpDiscovery {
                     broadcast = true
                 }
                 val broadcastAddress = InetSocketAddress("255.255.255.255", PORT)
-                val msg = "CP_PAIR|$role|$deviceName|$hash"
+                val portValue = filePort ?: 0
+                val msg = "CP_PAIR|$role|$deviceName|$hash|$portValue|$deviceType"
                 while (isActive) {
                     val packet = buildPacket { writeText(msg) }
                     socket.send(Datagram(packet, broadcastAddress))
@@ -246,5 +259,12 @@ object UdpDiscovery {
         currentExpectedPin = null
         currentPairingTargetHash = null
         _discoveredDevices.value = emptySet()
+    }
+
+    private fun sanitizeEndpointAddress(raw: String): String {
+        return raw
+            .removePrefix("/")
+            .substringBeforeLast(":", raw.removePrefix("/"))
+            .removeSurrounding("[", "]")
     }
 }
