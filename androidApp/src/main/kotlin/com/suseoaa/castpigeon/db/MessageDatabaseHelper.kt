@@ -5,14 +5,25 @@ import android.content.Context
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import com.suseoaa.castpigeon.shared.NotificationMessage
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import java.util.Calendar
+
+data class ClipboardHistoryItem(
+    val id: Long,
+    val content: String,
+    val direction: String,
+    val timestamp: Long
+)
 
 class MessageDatabaseHelper(private val context: Context) : SQLiteOpenHelper(context, DATABASE_NAME, null, DATABASE_VERSION) {
 
     companion object {
         private const val DATABASE_NAME = "castpigeon.db"
-        private const val DATABASE_VERSION = 2
+        private const val DATABASE_VERSION = 3
         private const val TABLE_MESSAGES = "messages"
+        private const val TABLE_CLIPBOARD_HISTORY = "clipboard_history"
         
         private const val COL_ID = "id"
         private const val COL_MSG_ID = "msg_id"
@@ -21,9 +32,22 @@ class MessageDatabaseHelper(private val context: Context) : SQLiteOpenHelper(con
         private const val COL_CONTENT = "content"
         private const val COL_TIMESTAMP = "timestamp"
         private const val COL_DEVICE_HASH = "device_hash"
+        private const val COL_DIRECTION = "direction"
+
+        private val _historyChanges = MutableSharedFlow<Unit>(replay = 1, extraBufferCapacity = 1)
+        val historyChanges: SharedFlow<Unit> = _historyChanges.asSharedFlow()
+
+        fun notifyHistoryChanged() {
+            _historyChanges.tryEmit(Unit)
+        }
     }
 
     override fun onCreate(db: SQLiteDatabase) {
+        createMessagesTable(db)
+        createClipboardHistoryTable(db)
+    }
+
+    private fun createMessagesTable(db: SQLiteDatabase) {
         val createTable = """
             CREATE TABLE $TABLE_MESSAGES (
                 $COL_ID INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,9 +62,23 @@ class MessageDatabaseHelper(private val context: Context) : SQLiteOpenHelper(con
         db.execSQL(createTable)
     }
 
+    private fun createClipboardHistoryTable(db: SQLiteDatabase) {
+        val createTable = """
+            CREATE TABLE IF NOT EXISTS $TABLE_CLIPBOARD_HISTORY (
+                $COL_ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                $COL_CONTENT TEXT NOT NULL,
+                $COL_DIRECTION TEXT NOT NULL,
+                $COL_TIMESTAMP INTEGER NOT NULL
+            )
+        """.trimIndent()
+        db.execSQL(createTable)
+        db.execSQL("CREATE INDEX IF NOT EXISTS idx_clipboard_history_timestamp ON $TABLE_CLIPBOARD_HISTORY($COL_TIMESTAMP DESC)")
+    }
+
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        db.execSQL("DROP TABLE IF EXISTS $TABLE_MESSAGES")
-        onCreate(db)
+        if (oldVersion < 3) {
+            createClipboardHistoryTable(db)
+        }
     }
 
     fun insertMessage(msg: NotificationMessage) {
@@ -67,8 +105,27 @@ class MessageDatabaseHelper(private val context: Context) : SQLiteOpenHelper(con
             put(COL_TIMESTAMP, msg.timestamp)
             put(COL_DEVICE_HASH, "local") // Android为发送端，记录为local即可
         }
-        db.insertWithOnConflict(TABLE_MESSAGES, null, values, SQLiteDatabase.CONFLICT_IGNORE)
+        val rowId = db.insertWithOnConflict(TABLE_MESSAGES, null, values, SQLiteDatabase.CONFLICT_IGNORE)
         db.close()
+        if (rowId != -1L) {
+            notifyHistoryChanged()
+        }
+    }
+
+    fun insertClipboardHistory(content: String, direction: String, timestamp: Long = System.currentTimeMillis()) {
+        if (content.isBlank()) return
+
+        val db = this.writableDatabase
+        val values = ContentValues().apply {
+            put(COL_CONTENT, content)
+            put(COL_DIRECTION, direction)
+            put(COL_TIMESTAMP, timestamp)
+        }
+        val rowId = db.insert(TABLE_CLIPBOARD_HISTORY, null, values)
+        db.close()
+        if (rowId != -1L) {
+            notifyHistoryChanged()
+        }
     }
 
     fun getTodayMessageCount(): Int {
@@ -106,6 +163,30 @@ class MessageDatabaseHelper(private val context: Context) : SQLiteOpenHelper(con
                     iconBase64 = null // 图标已保存为文件
                 )
                 list.add(msg)
+            } while (cursor.moveToNext())
+        }
+        cursor.close()
+        db.close()
+        return list
+    }
+
+    fun getAllClipboardHistory(): List<ClipboardHistoryItem> {
+        val db = this.readableDatabase
+        val list = mutableListOf<ClipboardHistoryItem>()
+        val cursor = db.rawQuery(
+            "SELECT $COL_ID, $COL_CONTENT, $COL_DIRECTION, $COL_TIMESTAMP FROM $TABLE_CLIPBOARD_HISTORY ORDER BY $COL_TIMESTAMP DESC",
+            null
+        )
+        if (cursor.moveToFirst()) {
+            do {
+                list.add(
+                    ClipboardHistoryItem(
+                        id = cursor.getLong(cursor.getColumnIndexOrThrow(COL_ID)),
+                        content = cursor.getString(cursor.getColumnIndexOrThrow(COL_CONTENT)),
+                        direction = cursor.getString(cursor.getColumnIndexOrThrow(COL_DIRECTION)),
+                        timestamp = cursor.getLong(cursor.getColumnIndexOrThrow(COL_TIMESTAMP))
+                    )
+                )
             } while (cursor.moveToNext())
         }
         cursor.close()

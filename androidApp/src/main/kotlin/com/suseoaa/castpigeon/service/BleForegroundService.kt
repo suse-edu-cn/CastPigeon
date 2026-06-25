@@ -124,6 +124,7 @@ class BleForegroundService : Service() {
         val payload = "CLIP|$text"
         try {
             AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
+            dbHelper.insertClipboardHistory(text, "sent_to_mac")
             android.util.Log.i("CastPigeon", "$source 发送到 Mac 成功")
         } catch (e: Exception) {
             android.util.Log.e("CastPigeon", "$source 发送到 Mac 失败", e)
@@ -164,6 +165,7 @@ class BleForegroundService : Service() {
         val payload = "CLIP|$text"
         try {
             AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
+            dbHelper.insertClipboardHistory(text, "sent_to_mac")
             android.util.Log.i("CastPigeon", "$trigger 补发缓存剪贴板到 Mac 成功")
         } catch (e: Exception) {
             pendingClipboardTextForMac = text
@@ -251,6 +253,7 @@ class BleForegroundService : Service() {
                     val payload = "CLIP|$text"
                     try {
                         AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
+                        dbHelper.insertClipboardHistory(text, "sent_to_mac")
                         Toast.makeText(this@BleForegroundService, "已推送到 Mac", Toast.LENGTH_SHORT).show()
                     } catch (e: Exception) {
                         e.printStackTrace()
@@ -394,17 +397,13 @@ class BleForegroundService : Service() {
             if (msg.startsWith("CLIP|")) {
                 val text = msg.substring(5)
                 lastSyncedText = text // 防止回环触发
+                dbHelper.insertClipboardHistory(text, "received_from_mac")
                 
                 val handled = writeClipboardDirectly(text, "Mac 剪贴板同步")
                     || writeClipboardViaPrivilege(text, "Mac 剪贴板同步")
 
-                if (handled) {
-                    showClipboardNotification(text)
-                }
-                
                 if (!handled) {
                     android.util.Log.e("CastPigeon", "收到 Mac 剪贴板但直接写入失败，未拉起空白页面")
-                    showClipboardNotification(text)
                 }
             } else if (msg.startsWith("CAP|")) {
                 handlePeerCapability(msg)
@@ -447,31 +446,6 @@ class BleForegroundService : Service() {
         val androidId = android.provider.Settings.Secure.getString(contentResolver, android.provider.Settings.Secure.ANDROID_ID) ?: "unknown"
         val bytes = java.security.MessageDigest.getInstance("SHA-256").digest(androidId.toByteArray())
         return bytes.copyOfRange(0, 4)
-    }
-
-    private fun showClipboardNotification(text: String) {
-        val copyIntent = Intent("com.suseoaa.castpigeon.ACTION_COPY_CLIPBOARD").apply {
-            setPackage(packageName)
-            putExtra("EXTRA_TEXT", text)
-            putExtra("EXTRA_NOTIF_ID", 1002)
-        }
-        val copyPendingIntent = android.app.PendingIntent.getBroadcast(
-            this, 1, copyIntent, android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
-        )
-
-        val preview = if (text.length > 30) text.take(30) + "..." else text
-        val notif = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(com.suseoaa.castpigeon.R.mipmap.ic_launcher_round)
-            .setContentTitle("收到来自 Mac 的剪贴板")
-            .setContentText(preview)
-            .setPriority(NotificationCompat.PRIORITY_MAX)
-            .setDefaults(NotificationCompat.DEFAULT_ALL)
-            .setAutoCancel(true)
-            .addAction(0, "📋 点击复制", copyPendingIntent)
-            .build()
-            
-        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        notificationManager.notify(1002, notif)
     }
 
     private fun encodeNotificationForBle(message: com.suseoaa.castpigeon.shared.NotificationMessage): String? {

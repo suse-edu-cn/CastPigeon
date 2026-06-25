@@ -1,12 +1,17 @@
 package com.suseoaa.castpigeon.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
+import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -18,27 +23,50 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.suseoaa.castpigeon.db.ClipboardHistoryItem
 import com.suseoaa.castpigeon.db.MessageDatabaseHelper
+import com.suseoaa.castpigeon.service.BleForegroundService
 import com.suseoaa.castpigeon.shared.NotificationMessage
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.*
 import android.graphics.BitmapFactory
 
+private enum class HistoryTab(val title: String) {
+    Messages("消息"),
+    Clipboard("粘贴板")
+}
+
+private data class HistoryUiState(
+    val messages: List<NotificationMessage> = emptyList(),
+    val clipboardItems: List<ClipboardHistoryItem> = emptyList(),
+    val isLoading: Boolean = true
+)
+
 @Composable
 fun HistoryScreen() {
     val context = LocalContext.current
-    var messages by remember { mutableStateOf<List<NotificationMessage>>(emptyList()) }
-    var isLoading by remember { mutableStateOf(true) }
+    var selectedTab by remember { mutableStateOf(HistoryTab.Messages) }
+    var uiState by remember { mutableStateOf(HistoryUiState()) }
 
     LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
-            val dbHelper = MessageDatabaseHelper(context)
-            messages = dbHelper.getAllMessages()
-            isLoading = false
-        }
+        MessageDatabaseHelper.historyChanges
+            .onStart { emit(Unit) }
+            .collectLatest {
+                val state = withContext(Dispatchers.IO) {
+                    val dbHelper = MessageDatabaseHelper(context.applicationContext)
+                    HistoryUiState(
+                        messages = dbHelper.getAllMessages(),
+                        clipboardItems = dbHelper.getAllClipboardHistory(),
+                        isLoading = false
+                    )
+                }
+                uiState = state
+            }
     }
 
     Column(
@@ -49,15 +77,28 @@ fun HistoryScreen() {
         Box(modifier = Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.surface).padding(horizontal = 24.dp, vertical = 16.dp)) {
             Text("发送历史记录", fontSize = 24.sp, fontWeight = FontWeight.Bold)
         }
+        TabRow(selectedTabIndex = HistoryTab.entries.indexOf(selectedTab)) {
+            HistoryTab.entries.forEach { tab ->
+                Tab(
+                    selected = selectedTab == tab,
+                    onClick = { selectedTab = tab },
+                    text = { Text(tab.title) }
+                )
+            }
+        }
         HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
 
-        if (isLoading) {
+        if (uiState.isLoading) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator()
             }
-        } else if (messages.isEmpty()) {
+        } else if (selectedTab == HistoryTab.Messages && uiState.messages.isEmpty()) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text("暂无发送记录", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        } else if (selectedTab == HistoryTab.Clipboard && uiState.clipboardItems.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text("暂无粘贴板记录", color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         } else {
             LazyColumn(
@@ -65,9 +106,76 @@ fun HistoryScreen() {
                 verticalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.weight(1f)
             ) {
-                items(messages, key = { it.id }) { msg ->
-                    HistoryItemCard(msg)
+                if (selectedTab == HistoryTab.Messages) {
+                    items(uiState.messages, key = { it.id }) { msg ->
+                        HistoryItemCard(msg)
+                    }
+                } else {
+                    items(uiState.clipboardItems, key = { it.id }) { item ->
+                        ClipboardHistoryCard(item)
+                    }
                 }
+            }
+        }
+    }
+}
+
+@Composable
+fun ClipboardHistoryCard(item: ClipboardHistoryItem) {
+    val context = LocalContext.current
+    val sdf = remember { SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()) }
+    val timeStr = sdf.format(Date(item.timestamp))
+    val directionText = when (item.direction) {
+        "sent_to_mac" -> "发送到 Mac"
+        "received_from_mac" -> "来自 Mac"
+        else -> "粘贴板"
+    }
+
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Row(
+            modifier = Modifier.padding(16.dp),
+            verticalAlignment = Alignment.Top
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        directionText,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(timeStr, fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    item.content,
+                    fontSize = 14.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 5,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            IconButton(
+                onClick = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    BleForegroundService.isInternalClipboardWrite = true
+                    clipboard.setPrimaryClip(ClipData.newPlainText("CastPigeon", item.content))
+                    Toast.makeText(context, "已复制到剪贴板", Toast.LENGTH_SHORT).show()
+                }
+            ) {
+                Icon(
+                    Icons.Default.ContentCopy,
+                    contentDescription = "复制粘贴板内容",
+                    tint = MaterialTheme.colorScheme.primary
+                )
             }
         }
     }
