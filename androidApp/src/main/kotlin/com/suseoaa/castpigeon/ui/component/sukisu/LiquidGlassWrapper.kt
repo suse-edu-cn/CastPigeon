@@ -17,7 +17,7 @@ import com.suseoaa.castpigeon.ui.AppTab
 
 import androidx.compose.ui.layout.onSizeChanged
 
-private const val BOTTOM_BAR_BLUR_ENABLED = false
+private const val BOTTOM_BAR_BLUR_ENABLED = true
 
 @Composable
 fun LiquidGlassBackdropWrapper(
