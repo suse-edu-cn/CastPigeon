@@ -35,6 +35,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.text.KeyboardOptions
@@ -42,6 +43,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationManagerCompat
 import android.content.Intent
+import com.mikepenz.markdown.m3.Markdown
+import com.mikepenz.markdown.m3.markdownColor
+import com.mikepenz.markdown.m3.markdownTypography
 import com.suseoaa.castpigeon.shared.*
 import com.suseoaa.castpigeon.shared.network.*
 import kotlinx.coroutines.launch
@@ -56,6 +60,7 @@ import com.suseoaa.castpigeon.shared.crypto.Crypto
 import kotlinx.serialization.encodeToString
 import com.suseoaa.castpigeon.service.AppConnectionManager
 import com.suseoaa.castpigeon.service.LanFileTransferManager
+import com.suseoaa.castpigeon.update.AppUpdateManager
 import androidx.core.content.edit
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import dev.chrisbanes.haze.HazeState
@@ -77,12 +82,14 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Info
 
 // 底部导航项
 enum class AppTab(val title: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
     Dashboard("状态看板", Icons.Default.Home),
     History("历史记录", Icons.Default.History),
-    Settings("同步设置", Icons.Default.Settings)
+    Settings("同步设置", Icons.Default.Settings),
+    Info("信息", Icons.Default.Info)
 }
 
 data class BoundDeviceEntry(
@@ -592,6 +599,7 @@ fun MainScreen(
 
                         AppTab.History -> HistoryScreen()
                         AppTab.Settings -> SettingsContent()
+                        AppTab.Info -> InfoContent()
                     }
                 }
             }
@@ -1526,6 +1534,373 @@ fun SettingsContent() {
             }
         }
     }
+}
+
+@Composable
+fun InfoContent() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var updateInfo by remember { mutableStateOf<AppUpdateManager.UpdateInfo?>(null) }
+    var historyReleases by remember { mutableStateOf<List<AppUpdateManager.ReleaseInfo>>(emptyList()) }
+    var updateMessage by remember { mutableStateOf<String?>(null) }
+    var historyMessage by remember { mutableStateOf<String?>(null) }
+    var isCheckingUpdate by remember { mutableStateOf(false) }
+    var isLoadingHistory by remember { mutableStateOf(false) }
+    val downloadStates = remember { mutableStateMapOf<String, ReleaseDownloadState>() }
+    val currentVersion = remember { AppUpdateManager.currentVersionName(context) }
+
+    fun checkUpdate(showNoUpdateToast: Boolean) {
+        if (isCheckingUpdate) return
+        isCheckingUpdate = true
+        updateMessage = null
+        scope.launch {
+            val result = AppUpdateManager.checkForUpdate(context.applicationContext)
+            isCheckingUpdate = false
+            result
+                .onSuccess { info ->
+                    updateInfo = info
+                    if (info == null && showNoUpdateToast) {
+                        android.widget.Toast.makeText(context, "当前已是最新版本", android.widget.Toast.LENGTH_SHORT).show()
+                    }
+                    if (info == null) {
+                        updateMessage = "当前没有可用更新"
+                    }
+                }
+                .onFailure { error ->
+                    updateMessage = error.message ?: "检查更新失败"
+                }
+        }
+    }
+
+    fun loadHistory() {
+        if (isLoadingHistory) return
+        isLoadingHistory = true
+        historyMessage = null
+        scope.launch {
+            AppUpdateManager.getHistoryReleases()
+                .onSuccess { releases ->
+                    historyReleases = releases
+                    historyMessage = if (releases.isEmpty()) "暂无历史版本" else null
+                }
+                .onFailure { error ->
+                    historyMessage = error.message ?: "获取历史更新失败"
+                }
+            isLoadingHistory = false
+        }
+    }
+
+    fun startDownload(release: AppUpdateManager.ReleaseInfo) {
+        val isOtherDownloading = downloadStates.values.any { it.progress in 0 until 100 || it.isVerifying }
+        if (isOtherDownloading) {
+            android.widget.Toast.makeText(context, "已有安装包正在下载", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val downloadId = AppUpdateManager.enqueueApkDownload(context.applicationContext, release)
+        downloadStates[release.tagName] = ReleaseDownloadState(downloadId = downloadId, progress = 0)
+
+        scope.launch {
+            var progress = 0
+            while (progress in 0 until 100) {
+                kotlinx.coroutines.delay(600)
+                progress = AppUpdateManager.getDownloadProgress(context.applicationContext, downloadId)
+                downloadStates[release.tagName] = downloadStates[release.tagName]
+                    ?.copy(progress = progress.coerceAtLeast(0))
+                    ?: ReleaseDownloadState(downloadId = downloadId, progress = progress.coerceAtLeast(0))
+            }
+
+            if (progress >= 100) {
+                downloadStates[release.tagName] = downloadStates[release.tagName]?.copy(isVerifying = true)
+                    ?: ReleaseDownloadState(downloadId = downloadId, progress = 100, isVerifying = true)
+
+                // 下载完成后按 GitHub Release 提供的 digest 做完整性校验，避免代理或网络异常产生坏包。
+                val isValid = AppUpdateManager.verifyDownloadedApk(
+                    context.applicationContext,
+                    downloadId,
+                    release.asset.digest
+                )
+                downloadStates[release.tagName] = downloadStates[release.tagName]?.copy(
+                    progress = 100,
+                    isVerifying = false,
+                    isVerified = isValid,
+                    message = if (isValid) "下载完成，可以安装" else "安装包校验失败，请重新下载"
+                ) ?: ReleaseDownloadState(
+                    downloadId = downloadId,
+                    progress = 100,
+                    isVerified = isValid,
+                    message = if (isValid) "下载完成，可以安装" else "安装包校验失败，请重新下载"
+                )
+            }
+        }
+    }
+
+    fun installRelease(release: AppUpdateManager.ReleaseInfo) {
+        val downloadId = downloadStates[release.tagName]?.downloadId
+        if (downloadId == null) {
+            android.widget.Toast.makeText(context, "未找到已下载的安装包", android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        val started = AppUpdateManager.installDownloadedApk(context.applicationContext, downloadId)
+        if (!started) {
+            android.widget.Toast.makeText(context, "未找到已下载的安装包", android.widget.Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        checkUpdate(showNoUpdateToast = false)
+        loadHistory()
+    }
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding(),
+        contentPadding = PaddingValues(start = 24.dp, end = 24.dp, top = 16.dp, bottom = 112.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        item(key = "title") {
+            Text("信息", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        }
+
+        item(key = "about") {
+            ElevatedCard(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            imageVector = Icons.Default.Info,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text("CastPigeon", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Text(
+                        "面向 Android 与 macOS 的近场同步工具，用蓝牙与局域网通道完成设备绑定、通知同步、剪贴板同步和文件传输。",
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        "当前版本 $currentVersion",
+                        fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+
+        item(key = "update") {
+            ElevatedCard(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("自动更新", fontWeight = FontWeight.Medium)
+                            Text(
+                                "从 GitHub Release 检查 Android 安装包和更新日志",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        TextButton(
+                            onClick = { checkUpdate(showNoUpdateToast = true) },
+                            enabled = !isCheckingUpdate
+                        ) {
+                            Text(if (isCheckingUpdate) "检查中" else "检查更新")
+                        }
+                    }
+
+                    updateInfo?.let { info ->
+                        ReleaseUpdateCard(
+                            title = "发现新版本 ${info.latestRelease.versionName}",
+                            release = info.latestRelease,
+                            markdown = info.mergedBody,
+                            downloadState = downloadStates[info.latestRelease.tagName] ?: ReleaseDownloadState(),
+                            onDownload = { startDownload(info.latestRelease) },
+                            onInstall = { installRelease(info.latestRelease) }
+                        )
+                        if (info.includedReleases.size > 1) {
+                            Text(
+                                "已合并 ${info.includedReleases.size} 个版本的更新日志",
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    } ?: Text(
+                        updateMessage ?: if (isCheckingUpdate) "正在检查更新..." else "当前没有可用更新",
+                        fontSize = 12.sp,
+                        color = updateMessage?.let { MaterialTheme.colorScheme.error }
+                            ?: MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+
+        item(key = "history-title") {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("历史更新", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                TextButton(
+                    onClick = { loadHistory() },
+                    enabled = !isLoadingHistory
+                ) {
+                    Text(if (isLoadingHistory) "加载中" else "刷新")
+                }
+            }
+        }
+
+        if (historyMessage != null) {
+            item(key = "history-message") {
+                Text(
+                    historyMessage.orEmpty(),
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+
+        items(
+            items = historyReleases,
+            key = { release -> "release-${release.tagName}" }
+        ) { release ->
+            ReleaseUpdateCard(
+                title = "CastPigeon Android ${release.versionName}",
+                release = release,
+                markdown = release.body,
+                downloadState = downloadStates[release.tagName] ?: ReleaseDownloadState(),
+                onDownload = { startDownload(release) },
+                onInstall = { installRelease(release) }
+            )
+        }
+    }
+}
+
+private data class ReleaseDownloadState(
+    val downloadId: Long? = null,
+    val progress: Int = -1,
+    val isVerifying: Boolean = false,
+    val isVerified: Boolean = false,
+    val message: String? = null
+)
+
+@Composable
+private fun ReleaseUpdateCard(
+    title: String,
+    release: AppUpdateManager.ReleaseInfo,
+    markdown: String,
+    downloadState: ReleaseDownloadState,
+    onDownload: () -> Unit,
+    onInstall: () -> Unit
+) {
+    ElevatedCard(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(title, fontWeight = FontWeight.SemiBold, color = MaterialTheme.colorScheme.primary)
+            Text(
+                release.asset.assetName,
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            CastPigeonMarkdown(markdown = markdown)
+
+            if (downloadState.progress in 0 until 100 || downloadState.isVerifying) {
+                LinearProgressIndicator(
+                    progress = { (downloadState.progress.coerceIn(0, 100)) / 100f },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text(
+                    if (downloadState.isVerifying) "正在校验安装包..." else "${downloadState.progress.coerceIn(0, 100)}%",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            downloadState.message?.let { message ->
+                Text(
+                    message,
+                    fontSize = 12.sp,
+                    color = if (downloadState.isVerified) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                )
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(
+                    onClick = onDownload,
+                    enabled = downloadState.progress !in 0 until 100 && !downloadState.isVerifying
+                ) {
+                    Text(if (downloadState.progress == 100) "重新下载 APK" else "下载 APK")
+                }
+                if (downloadState.isVerified) {
+                    OutlinedButton(onClick = onInstall) {
+                        Text("安装")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CastPigeonMarkdown(
+    markdown: String,
+    modifier: Modifier = Modifier
+) {
+    if (markdown.isBlank()) {
+        Text(
+            "暂无更新日志",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        return
+    }
+
+    // GitHub Release 使用 Markdown 编写，这里保留标题、列表和链接的层级关系。
+    Markdown(
+        content = markdown,
+        modifier = modifier.fillMaxWidth(),
+        typography = markdownTypography(
+            h1 = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+            h2 = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+            h3 = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+            h4 = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+            paragraph = MaterialTheme.typography.bodySmall,
+            bullet = MaterialTheme.typography.bodySmall,
+            list = MaterialTheme.typography.bodySmall,
+            quote = MaterialTheme.typography.bodySmall.copy(fontStyle = FontStyle.Italic)
+        ),
+        colors = markdownColor(
+            text = MaterialTheme.colorScheme.onSurface,
+            codeBackground = MaterialTheme.colorScheme.surface.copy(alpha = 0.7f),
+            inlineCodeBackground = MaterialTheme.colorScheme.surface.copy(alpha = 0.7f)
+        )
+    )
 }
 
 private fun startBluetoothAction(

@@ -1,0 +1,233 @@
+name: Release on Version Update
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "androidApp/build.gradle.kts"
+      - "macosApp/CastPigeonMac/Info.plist"
+      - "macosApp/CastPigeonMac.xcodeproj/project.pbxproj"
+      - ".github/workflows/release.yml"
+      - ".github/scripts/build_changelog.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check-versions:
+    runs-on: ubuntu-latest
+    outputs:
+      android_changed: ${{ steps.check.outputs.android_changed }}
+      android_version: ${{ steps.check.outputs.android_version }}
+      android_tag: ${{ steps.check.outputs.android_tag }}
+      macos_changed: ${{ steps.check.outputs.macos_changed }}
+      macos_version: ${{ steps.check.outputs.macos_version }}
+      macos_tag: ${{ steps.check.outputs.macos_tag }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check Platform Versions
+        id: check
+        shell: bash
+        run: |
+          git fetch --tags --force
+
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          def version_parts(value):
+              return tuple(int(part) for part in re.findall(r"\d+", value))
+
+          def latest_tag_version(pattern, prefix):
+              tags = subprocess.check_output(["git", "tag", "--list", pattern], text=True).splitlines()
+              versions = []
+              for tag in tags:
+                  version = tag.removeprefix(prefix)
+                  versions.append((version_parts(version), version, tag))
+              return max(versions, default=None)
+
+          build_gradle = pathlib.Path("androidApp/build.gradle.kts").read_text()
+          android_match = re.search(r'versionName\s*=\s*"([^"]+)"', build_gradle)
+          if not android_match:
+              print("无法读取 Android versionName。", file=sys.stderr)
+              sys.exit(1)
+          android_version = android_match.group(1)
+
+          project_file = pathlib.Path("macosApp/CastPigeonMac.xcodeproj/project.pbxproj").read_text()
+          macos_matches = re.findall(r"MARKETING_VERSION\s*=\s*([^;]+);", project_file)
+          if not macos_matches:
+              print("无法读取 macOS MARKETING_VERSION。", file=sys.stderr)
+              sys.exit(1)
+          macos_versions = {value.strip().strip('"') for value in macos_matches}
+          if len(macos_versions) != 1:
+              print(f"macOS MARKETING_VERSION 不一致: {sorted(macos_versions)}", file=sys.stderr)
+              sys.exit(1)
+          macos_version = macos_versions.pop()
+
+          android_tag = f"android-v{android_version}"
+          macos_tag = f"macos-v{macos_version}"
+
+          android_latest = latest_tag_version("android-v*", "android-v")
+          macos_latest = latest_tag_version("macos-v*", "macos-v")
+
+          android_changed = android_latest is None or version_parts(android_version) > android_latest[0]
+          macos_changed = macos_latest is None or version_parts(macos_version) > macos_latest[0]
+
+          existing_tags = set(subprocess.check_output(["git", "tag", "--list"], text=True).splitlines())
+          if android_tag in existing_tags:
+              android_changed = False
+          if macos_tag in existing_tags:
+              macos_changed = False
+
+          print(f"android_version={android_version}")
+          print(f"android_tag={android_tag}")
+          print(f"android_changed={str(android_changed).lower()}")
+          print(f"macos_version={macos_version}")
+          print(f"macos_tag={macos_tag}")
+          print(f"macos_changed={str(macos_changed).lower()}")
+          PY
+
+  build-android:
+    needs: check-versions
+    if: needs.check-versions.outputs.android_changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Decode Android Keystore
+        shell: bash
+        env:
+          ENCODED_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$ENCODED_KEYSTORE" ]; then
+            echo "缺少 GitHub Secret: KEYSTORE_BASE64"
+            exit 1
+          fi
+          if [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "缺少 Android 签名 Secret: KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD"
+            exit 1
+          fi
+          echo "$ENCODED_KEYSTORE" | base64 -d > "$RUNNER_TEMP/castpigeon-release.jks"
+
+      - name: Build Signed Release APK
+        shell: bash
+        env:
+          KEYSTORE_FILE_PATH: ${{ runner.temp }}/castpigeon-release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon :androidApp:assembleRelease -PgithubRepository="${GITHUB_REPOSITORY}"
+
+          APK_DIR="androidApp/build/outputs/apk/release"
+          SRC_APK=$(find "$APK_DIR" -name "*.apk" | head -n 1)
+          if [ -z "$SRC_APK" ]; then
+            echo "未找到 release APK。"
+            exit 1
+          fi
+
+          OUT_APK="$APK_DIR/CastPigeon-Android-v${{ needs.check-versions.outputs.android_version }}.apk"
+          mv "$SRC_APK" "$OUT_APK"
+          sha256sum "$OUT_APK" > "$OUT_APK.sha256"
+
+      - name: Generate Android Changelog
+        shell: bash
+        run: |
+          git fetch --tags --force
+          python3 .github/scripts/build_changelog.py \
+            --platform Android \
+            --version "${{ needs.check-versions.outputs.android_version }}" \
+            --tag-prefix android-v \
+            --output changelog.txt
+
+      - name: Publish Android Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-versions.outputs.android_tag }}
+          name: CastPigeon Android v${{ needs.check-versions.outputs.android_version }}
+          body_path: changelog.txt
+          files: |
+            androidApp/build/outputs/apk/release/CastPigeon-Android-v${{ needs.check-versions.outputs.android_version }}.apk
+            androidApp/build/outputs/apk/release/CastPigeon-Android-v${{ needs.check-versions.outputs.android_version }}.apk.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-macos:
+    needs: check-versions
+    if: needs.check-versions.outputs.macos_changed == 'true'
+    runs-on: macos-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build ad-hoc signed macOS App
+        shell: bash
+        run: |
+          xcodebuild \
+            -project macosApp/CastPigeonMac.xcodeproj \
+            -scheme CastPigeonMac \
+            -configuration Release \
+            -derivedDataPath "$RUNNER_TEMP/CastPigeonDerivedData" \
+            INFOPLIST_KEY_CastPigeonGitHubRepository="${GITHUB_REPOSITORY}" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=YES \
+            build
+
+          APP="$RUNNER_TEMP/CastPigeonDerivedData/Build/Products/Release/CastPigeon.app"
+          if [ ! -d "$APP" ]; then
+            echo "未找到 macOS app bundle。"
+            exit 1
+          fi
+
+          mkdir -p dist
+          ditto -c -k --keepParent "$APP" "dist/CastPigeon-macOS-v${{ needs.check-versions.outputs.macos_version }}.zip"
+          shasum -a 256 "dist/CastPigeon-macOS-v${{ needs.check-versions.outputs.macos_version }}.zip" > "dist/CastPigeon-macOS-v${{ needs.check-versions.outputs.macos_version }}.zip.sha256"
+
+      - name: Generate macOS Changelog
+        shell: bash
+        run: |
+          git fetch --tags --force
+          python3 .github/scripts/build_changelog.py \
+            --platform macOS \
+            --version "${{ needs.check-versions.outputs.macos_version }}" \
+            --tag-prefix macos-v \
+            --output changelog.txt
+
+      - name: Publish macOS Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-versions.outputs.macos_tag }}
+          name: CastPigeon macOS v${{ needs.check-versions.outputs.macos_version }}
+          body_path: changelog.txt
+          files: |
+            dist/CastPigeon-macOS-v${{ needs.check-versions.outputs.macos_version }}.zip
+            dist/CastPigeon-macOS-v${{ needs.check-versions.outputs.macos_version }}.zip.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

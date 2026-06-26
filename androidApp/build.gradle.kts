@@ -1,5 +1,13 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
+val releaseRepository = providers.gradleProperty("githubRepository")
+    .orElse(providers.environmentVariable("GITHUB_REPOSITORY"))
+    .orElse("suse-edu-cn/CastPigeon")
+val localReleaseKeystorePath = "/Users/vincent/Desktop/SUSE-APP-Key/APP-Key.jks"
+val releaseKeystorePath = System.getenv("KEYSTORE_FILE_PATH")
+    ?.takeIf { it.isNotBlank() }
+    ?: localReleaseKeystorePath.takeIf { file(it).exists() }
+
 plugins {
     alias(libs.plugins.androidApplication)
     alias(libs.plugins.composeMultiplatform)
@@ -13,8 +21,8 @@ kotlin {
     }
 }
 dependencies {
-    implementation("dev.rikka.shizuku:api:13.1.5")
-    implementation("dev.rikka.shizuku:provider:13.1.5")
+    implementation(libs.api)
+    implementation(libs.provider)
     implementation(projects.sharedLogic)
     implementation(projects.sharedUI)
 
@@ -25,16 +33,17 @@ dependencies {
     implementation(libs.compose.runtime)
     implementation(libs.compose.foundation)
     implementation(libs.compose.material3)
-    implementation("com.github.topjohnwu.libsu:core:6.0.0")
-    implementation("com.github.topjohnwu.libsu:service:6.0.0")
+    implementation(libs.libsu.core)
+    implementation(libs.libsu.service)
     implementation(libs.compose.ui)
     implementation(libs.compose.uiToolingPreview)
     debugImplementation(libs.compose.uiTooling)
     
-    implementation("androidx.compose.material:material-icons-extended:1.6.0")
+    implementation(libs.androidx.material.icons.extended)
     
     implementation(libs.miuix.blur)
     implementation(libs.miuix.ui)
+    implementation(libs.multiplatform.markdown.renderer.m3)
     
     implementation(libs.haze)
     implementation(libs.haze.materials)
@@ -46,14 +55,17 @@ android {
 
     buildFeatures {
         aidl = true
+        buildConfig = true
     }
 
     defaultConfig {
         applicationId = "com.suseoaa.castpigeon"
         minSdk = libs.versions.android.minSdk.get().toInt()
+        //noinspection OldTargetApi
         targetSdk = libs.versions.android.targetSdk.get().toInt()
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 100
+        versionName = "1.0.0"
+        buildConfigField("String", "GITHUB_REPOSITORY", "\"${releaseRepository.get()}\"")
     }
     packaging {
         resources {
@@ -61,19 +73,31 @@ android {
         }
     }
     signingConfigs {
-        create("suseRelease") {
-            storeFile = file("/Users/vincent/Desktop/SUSE-APP-Key/APP-Key.jks")
-            storePassword = "LinuxisUbuntu18"
-            keyAlias = "suse-app-key"
-            keyPassword = "LinuxisUbuntu18"
+        create("release") {
+            if (!releaseKeystorePath.isNullOrBlank()) {
+                storeFile = file(releaseKeystorePath)
+                storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "LinuxisUbuntu18"
+                keyAlias = System.getenv("KEY_ALIAS") ?: "suse-app-key"
+                keyPassword = System.getenv("KEY_PASSWORD") ?: "LinuxisUbuntu18"
+            }
         }
     }
     buildTypes {
         getByName("debug") {
-            signingConfig = signingConfigs.getByName("suseRelease")
+            if (!releaseKeystorePath.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
         getByName("release") {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            if (!releaseKeystorePath.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
     compileOptions {

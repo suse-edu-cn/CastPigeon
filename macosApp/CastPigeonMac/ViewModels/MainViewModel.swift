@@ -20,6 +20,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     @Published var connectionStateName: String = "Idle"
     @Published var connectionStateDescription: String = "静默期，无硬件能耗。"
     @Published var isAnimating: Bool = false
+    @Published var bluetoothPermissionDenied: Bool = false
     @Published var receivedMessage: String? = nil
     @Published var receivedImage: Data? = nil
     
@@ -373,10 +374,51 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         }
         updateState(name: "Idle", desc: "静默期，无硬件能耗。")
     }
+
+    func openBluetoothPrivacySettings() {
+        let urls = [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Bluetooth",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy"
+        ]
+
+        for rawUrl in urls {
+            if let url = URL(string: rawUrl), NSWorkspace.shared.open(url) {
+                return
+            }
+        }
+        NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/System Settings.app"))
+    }
+
+    private func handleBluetoothUnavailable(_ state: CBManagerState, source: String) {
+        switch state {
+        case .unauthorized:
+            bluetoothPermissionDenied = true
+            isAnimating = false
+            updateState(name: "Bluetooth Unauthorized", desc: "CastPigeon 尚未获得蓝牙权限。")
+            logDebug("\(source) 被拦截: 蓝牙权限未授权 (当前状态: \(state.rawValue))")
+        case .poweredOff:
+            updateState(name: "Bluetooth Off", desc: "系统蓝牙未开启。")
+            logDebug("\(source) 被拦截: 蓝牙未开启 (当前状态: \(state.rawValue))")
+        case .unsupported:
+            updateState(name: "Bluetooth Unsupported", desc: "当前设备不支持蓝牙功能。")
+            logDebug("\(source) 被拦截: 当前设备不支持蓝牙 (当前状态: \(state.rawValue))")
+        case .resetting:
+            logDebug("\(source) 暂停: 蓝牙正在重置 (当前状态: \(state.rawValue))")
+        case .unknown:
+            logDebug("\(source) 暂停: 蓝牙状态未知 (当前状态: \(state.rawValue))")
+        case .poweredOn:
+            bluetoothPermissionDenied = false
+        @unknown default:
+            logDebug("\(source) 暂停: 未知蓝牙状态 (当前状态: \(state.rawValue))")
+        }
+    }
     
     // MARK: - Sender (Peripheral)
     private func startAdvertising() {
-        guard peripheralManager.state == .poweredOn else { return }
+        guard peripheralManager.state == .poweredOn else {
+            handleBluetoothUnavailable(peripheralManager.state, source: "startAdvertising")
+            return
+        }
         if !peripheralServiceConfigured {
             configurePeripheralService()
         }
@@ -397,6 +439,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
         guard peripheral === peripheralManager else { return }
         if peripheral.state == .poweredOn {
+            bluetoothPermissionDenied = false
             configurePeripheralService()
             
             if workMode == .working && role == .sender {
@@ -405,6 +448,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
                 }
             }
         } else {
+            handleBluetoothUnavailable(peripheral.state, source: "peripheralManager")
             peripheralServiceConfigured = false
             gattCharacteristic = nil
             gattHandshakeChar = nil
@@ -1181,9 +1225,10 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     private func startScan() {
         logDebug("调用了 startScan")
         guard centralManager.state == .poweredOn else {
-            logDebug("startScan 被拦截: 蓝牙未开启 (当前状态: \(centralManager.state.rawValue))")
+            handleBluetoothUnavailable(centralManager.state, source: "startScan")
             return
         }
+        bluetoothPermissionDenied = false
         cancelScanRestart()
         isAnimating = true
         updateState(name: "Scanning", desc: "正在寻找专属频率广播...")
@@ -1233,9 +1278,11 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         guard central === centralManager else { return }
         logDebug("蓝牙中心设备状态更新: \(central.state.rawValue)")
         if central.state == .poweredOn && workMode == .working && role == .receiver {
+            bluetoothPermissionDenied = false
             logDebug("蓝牙已开启，尝试恢复挂起的连接并开启扫描")
             startScan()
         } else if central.state != .poweredOn {
+            handleBluetoothUnavailable(central.state, source: "centralManager")
             isBleScanning = false
             cancelAllConnectionTimeouts()
         }
