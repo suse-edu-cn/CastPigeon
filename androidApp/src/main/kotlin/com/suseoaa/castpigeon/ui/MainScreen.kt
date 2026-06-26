@@ -76,6 +76,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Search
 
 // 底部导航项
 enum class AppTab(val title: String, val icon: androidx.compose.ui.graphics.vector.ImageVector) {
@@ -1360,6 +1361,18 @@ private fun AdvancedLabCard() {
 fun SettingsContent() {
     val apps by AppManager.appList.collectAsState()
     val showSystemApps by AppManager.showSystemApps.collectAsState()
+    var appSearchQuery by remember { mutableStateOf("") }
+    val filteredApps = remember(apps, appSearchQuery) {
+        val query = appSearchQuery.trim()
+        if (query.isEmpty()) {
+            apps
+        } else {
+            apps.filter { app ->
+                app.appName.contains(query, ignoreCase = true) ||
+                    app.packageName.contains(query, ignoreCase = true)
+            }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -1408,19 +1421,64 @@ fun SettingsContent() {
         }
         Spacer(modifier = Modifier.height(8.dp))
 
+        OutlinedTextField(
+            value = appSearchQuery,
+            onValueChange = { appSearchQuery = it },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp),
+            singleLine = true,
+            leadingIcon = {
+                Icon(
+                    imageVector = Icons.Default.Search,
+                    contentDescription = null
+                )
+            },
+            trailingIcon = {
+                if (appSearchQuery.isNotEmpty()) {
+                    IconButton(onClick = { appSearchQuery = "" }) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "清空搜索"
+                        )
+                    }
+                }
+            },
+            placeholder = { Text("搜索应用名称或包名") },
+            shape = RoundedCornerShape(16.dp)
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+
         HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
         if (apps.isEmpty()) {
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .weight(1f)
                     .padding(24.dp),
                 contentAlignment = Alignment.Center
             ) {
                 CircularProgressIndicator()
             }
+        } else if (filteredApps.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .padding(24.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    "没有找到匹配的应用",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
         } else {
-            LazyColumn(contentPadding = PaddingValues(bottom = 80.dp)) {
-                items(apps, key = { it.packageName }) { app ->
+            LazyColumn(
+                modifier = Modifier.weight(1f),
+                contentPadding = PaddingValues(bottom = 80.dp)
+            ) {
+                items(filteredApps, key = { it.packageName }) { app ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
