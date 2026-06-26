@@ -7,6 +7,7 @@ package com.suseoaa.castpigeon.shared
 */
 actual class BlePeripheral actual constructor() {
     actual var onMessageReceived: ((String) -> Unit)? = null
+    actual var onPeerAuthorizationRequested: ((String, String) -> Boolean)? = null
     actual fun startAdvertising(workMode: WorkMode, deviceIdHash: ByteArray, onStateChange: (ConnectionState, String?) -> Unit) {}
     actual fun updateTrustedPeerHashes(hashes: Set<String>) {}
     actual fun stopAdvertising() {}

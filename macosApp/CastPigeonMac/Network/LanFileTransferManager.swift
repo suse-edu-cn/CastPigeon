@@ -37,6 +37,7 @@ final class LanFileTransferManager: ObservableObject {
 
     @Published private(set) var serverPort: Int = 48602
     @Published private(set) var transferStatus: TransferStatus? = nil
+    var onNotificationPayloadReceived: ((Data, String) -> Void)?
 
     private init() {}
 
@@ -188,17 +189,37 @@ final class LanFileTransferManager: ObservableObject {
         }
 
         let lines = headerText.components(separatedBy: "\r\n")
-        guard let requestLine = lines.first, requestLine.hasPrefix("POST /upload") else {
+        guard let requestLine = lines.first, requestLine.hasPrefix("POST ") else {
+            writeResponse(connection: connection, code: 400, body: "Bad Request")
+            return
+        }
+
+        var headers: [String: String] = [:]
+        for line in lines.dropFirst() {
+            let parts = line.split(separator: ":", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespaces) }
+            if parts.count == 2 {
+                headers[parts[0].lowercased()] = parts[1]
+            }
+        }
+
+        if requestLine.hasPrefix("POST /notification") {
+            let deviceHash = headers["x-castpigeon-device-hash"]?.uppercased() ?? "unknown"
+            let payload = Data(bodyData)
+            DispatchQueue.main.async {
+                self.onNotificationPayloadReceived?(payload, deviceHash)
+            }
+            writeResponse(connection: connection, code: 200, body: "OK")
+            return
+        }
+
+        guard requestLine.hasPrefix("POST /upload") else {
             writeResponse(connection: connection, code: 404, body: "Not Found")
             return
         }
 
         var fileName = "CastPigeon-\(Int(Date().timeIntervalSince1970))"
-        for line in lines.dropFirst() {
-            let parts = line.split(separator: ":", maxSplits: 1).map { String($0).trimmingCharacters(in: .whitespaces) }
-            if parts.count == 2 && parts[0].lowercased() == "x-castpigeon-filename" {
-                fileName = parts[1].removingPercentEncoding ?? parts[1]
-            }
+        if let encodedFileName = headers["x-castpigeon-filename"] {
+            fileName = encodedFileName.removingPercentEncoding ?? encodedFileName
         }
 
         if let nameQuery = requestLine.components(separatedBy: "name=").dropFirst().first?.components(separatedBy: " ").first {

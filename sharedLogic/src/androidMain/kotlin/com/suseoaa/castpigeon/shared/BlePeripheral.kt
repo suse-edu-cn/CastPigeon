@@ -49,6 +49,12 @@ actual class BlePeripheral actual constructor() {
     actual var onMessageReceived: ((String) -> Unit)? = null
     private val writeBuffers = java.util.concurrent.ConcurrentHashMap<String, java.io.ByteArrayOutputStream>()
     private val subscribedDevices = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val peerLabels = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val pendingPayloads = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.LinkedBlockingDeque<ByteArray>>()
+    private val pendingPayloadTimeouts = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
+    private val orphanPendingPayloads = java.util.concurrent.LinkedBlockingDeque<ByteArray>()
+    private val flushingDevices = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    private val subscriptionWatchdogs = java.util.concurrent.ConcurrentHashMap<String, Runnable>()
     private var pendingAdvertiseSettings: AdvertiseSettings? = null
     private var pendingAdvertiseData: AdvertiseData? = null
     private var currentWorkMode: WorkMode = WorkMode.Idle
@@ -59,9 +65,15 @@ actual class BlePeripheral actual constructor() {
     private var isAdvertising = false
     private var restartAdvertiseDelayMs = 1_000L
     private var restartAdvertiseRunnable: Runnable? = null
-    private val pendingSendRunnables = java.util.concurrent.CopyOnWriteArrayList<Runnable>()
     @Volatile
     private var pendingNotificationAck: CompletableDeferred<Int>? = null
+
+    private companion object {
+        const val MAX_PENDING_PAYLOADS_PER_DEVICE = 32
+        const val PENDING_SUBSCRIPTION_TIMEOUT_MS = 60_000L
+        const val PENDING_SEND_RETRY_DELAY_MS = 1_000L
+        const val SUBSCRIPTION_READY_TIMEOUT_MS = 10_000L
+    }
 
     //CastPigeon专属的跨端通信UUID，用于广播和过滤
     private val serviceUuid = UUID.fromString("A1B2C3D4-E5F6-47A8-B9C0-D1E2F3A4B5C6")
@@ -70,6 +82,7 @@ actual class BlePeripheral actual constructor() {
     private val cccdUuid = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     
     private var stateListener: ((ConnectionState, String?) -> Unit)? = null
+    actual var onPeerAuthorizationRequested: ((String, String) -> Boolean)? = null
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
@@ -102,6 +115,10 @@ actual class BlePeripheral actual constructor() {
                     connectedDevice = device
                     currentMtu = 23
                     restartAdvertiseDelayMs = 1_000L
+                    if (device != null) {
+                        mergeOrphanPayloads(device.address)
+                        scheduleSubscriptionWatchdog(device)
+                    }
                     //不在这里直接跃迁为Transferring，而是等待订阅或握手。
                     //连接期间暂停广播，断开后会自动恢复。
                     stopAdvertisingInternal(clearWanted = false)
@@ -114,10 +131,12 @@ actual class BlePeripheral actual constructor() {
                     if (address != null) {
                         subscribedDevices.remove(address)
                         writeBuffers.remove(address)
+                        peerLabels.remove(address)
+                        movePendingPayloadsToOrphan(address)
+                        cancelSubscriptionWatchdog(address)
                     }
                     pendingNotificationAck?.complete(BluetoothGatt.GATT_FAILURE)
                     pendingNotificationAck = null
-                    cancelPendingSendRetries()
                     currentMtu = 23
                     stateListener?.invoke(ConnectionState.Disconnecting, null)
                     if (advertisingWanted && currentWorkMode != WorkMode.Idle) {
@@ -192,10 +211,18 @@ actual class BlePeripheral actual constructor() {
             val text = try { String(value) } catch (e: Exception) { null }
             Log.i("BlePeripheral", "processCharacteristicWrite: length=${value.size}, textSnippet=${if (text != null && text.length > 20) text.take(20) else text}")
             
-            if (text != null && (text.startsWith("CLIP|") || text.startsWith("CAP|") || text.startsWith("CAP_LOST|"))) {
+            if (text != null && (
+                    text.startsWith("CLIP|") ||
+                        text.startsWith("CLIP2|") ||
+                        text.startsWith("CAP|") ||
+                        text.startsWith("CAP_PEER|") ||
+                        text.startsWith("CAP_LOST|") ||
+                        text.startsWith("CAP_LOST2|")
+                    )
+            ) {
                 if (currentWorkMode == WorkMode.Working) {
                     connectedDevice = device
-                    stateListener?.invoke(ConnectionState.Transferring, null)
+                    stateListener?.invoke(ConnectionState.Transferring, peerLabels[device.address])
                 }
                 onMessageReceived?.invoke(text)
                 return
@@ -207,17 +234,23 @@ actual class BlePeripheral actual constructor() {
                 val peerHash = parts.getOrNull(3)?.uppercase().orEmpty()
                 if (currentWorkMode == WorkMode.Working) {
                     val trusted = trustedPeerHashes
-                    if (trusted.isEmpty() || !trusted.contains(peerHash)) {
+                    val authorized = trusted.contains(peerHash) ||
+                        onPeerAuthorizationRequested?.invoke(peerName, peerHash) == true
+                    if (!authorized) {
                         Log.w("BlePeripheral", "拒绝未绑定设备握手: name=$peerName hash=$peerHash")
                         @SuppressLint("MissingPermission")
                         gattServer?.cancelConnection(device)
                         return
                     }
                     connectedDevice = device
-                    stateListener?.invoke(ConnectionState.Transferring, "$peerName|$peerHash")
+                    val peerLabel = "$peerName|$peerHash"
+                    peerLabels[device.address] = peerLabel
+                    stateListener?.invoke(ConnectionState.Transferring, peerLabel)
                     return
                 }
-                stateListener?.invoke(ConnectionState.PairingRequest, "$peerName|$peerHash")
+                val peerLabel = "$peerName|$peerHash"
+                peerLabels[device.address] = peerLabel
+                stateListener?.invoke(ConnectionState.PairingRequest, peerLabel)
                 return
             }
             
@@ -255,11 +288,16 @@ actual class BlePeripheral actual constructor() {
                 if (value?.contentEquals(android.bluetooth.BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) == true) {
                     subscribedDevices.add(device.address)
                     connectedDevice = device
+                    mergeOrphanPayloads(device.address)
+                    cancelPendingPayloadTimeout(device.address)
+                    cancelSubscriptionWatchdog(device.address)
                     if (currentWorkMode == WorkMode.Working) {
-                        stateListener?.invoke(ConnectionState.Transferring, null)
+                        stateListener?.invoke(ConnectionState.Transferring, peerLabels[device.address])
                     }
+                    flushPendingPayloads(device)
                 } else if (value?.contentEquals(android.bluetooth.BluetoothGattDescriptor.DISABLE_NOTIFICATION_VALUE) == true) {
                     subscribedDevices.remove(device.address)
+                    schedulePendingPayloadTimeout(device.address)
                 }
             }
             if (responseNeeded) {
@@ -273,9 +311,10 @@ actual class BlePeripheral actual constructor() {
             currentMtu = mtu
             Log.i("BlePeripheral", "onMtuChanged mtu=$mtu device=${device?.address}")
             //macOS端主动发起MTU=512协商，此处接收协商结果
-            if (device?.address == connectedDevice?.address) {
+            val address = device?.address
+            if (address == connectedDevice?.address) {
                 //如果是已经授权的设备，在MTU协商后进入传输期
-                stateListener?.invoke(ConnectionState.Transferring, null)
+                stateListener?.invoke(ConnectionState.Transferring, peerLabels[address])
             }
         }
 
@@ -362,7 +401,7 @@ actual class BlePeripheral actual constructor() {
         Log.i("BlePeripheral", "GattServer & Advertiser 初始化成功")
         
         stopAdvertisingInternal(clearWanted = false)
-        closeGattServer("重启广播会话前清理旧 GATT Server")
+        closeGattServer("重启广播会话前清理旧 GATT Server", clearQueuedPayloads = false)
         
         gattServer = bluetoothManager.openGattServer(context, gattServerCallback)
         if (gattServer == null) {
@@ -425,73 +464,123 @@ actual class BlePeripheral actual constructor() {
         }
         pendingNotificationAck?.complete(BluetoothGatt.GATT_FAILURE)
         pendingNotificationAck = null
-        cancelPendingSendRetries()
+        clearAllSubscriptionWatchdogs()
+        clearAllPendingPayloads()
     }
 
     @SuppressLint("MissingPermission")
     actual fun sendNotificationData(payload: ByteArray) {
-        sendNotificationData(payload, pendingSubscriptionAttempts = 8)
+        val device = connectedDevice
+        if (device == null) {
+            enqueueOrphanPayload(payload)
+            Log.w(
+                "BlePeripheral",
+                "sendNotificationData deferred: no connected device, orphanPending=${orphanPendingPayloads.size} payloadLength=${payload.size}"
+            )
+            return
+        }
+        enqueuePendingPayload(device.address, payload)
+        if (!subscribedDevices.contains(device.address)) {
+            schedulePendingPayloadTimeout(device.address)
+            Log.i(
+                "BlePeripheral",
+                "中心设备尚未订阅，已加入待发送队列 address=${device.address} pending=${pendingPayloads[device.address]?.size ?: 0} payloadLength=${payload.size}"
+            )
+            return
+        }
+        flushPendingPayloads(device)
     }
 
     @SuppressLint("MissingPermission")
-    private fun sendNotificationData(payload: ByteArray, pendingSubscriptionAttempts: Int) {
-        val device = connectedDevice
-        if (device == null) {
-            Log.w("BlePeripheral", "sendNotificationData skipped: no connected device, payloadLength=${payload.size}")
-            return
-        }
-        if (!subscribedDevices.contains(device.address)) {
-            if (pendingSubscriptionAttempts > 0) {
-                Log.i("BlePeripheral", "等待中心设备订阅后发送，remaining=$pendingSubscriptionAttempts payloadLength=${payload.size}")
-                val retry = object : Runnable {
-                    override fun run() {
-                        pendingSendRunnables.remove(this)
-                        sendNotificationData(payload, pendingSubscriptionAttempts - 1)
-                    }
-                }
-                pendingSendRunnables.add(retry)
-                handler.postDelayed(retry, 250)
-            } else {
-                Log.w("BlePeripheral", "sendNotificationData skipped: device has not subscribed yet, payloadLength=${payload.size}")
-            }
-            return
-        }
+    private fun flushPendingPayloads(device: BluetoothDevice) {
+        val address = device.address
+        if (!subscribedDevices.contains(address)) return
+        if (!flushingDevices.add(address)) return
+
         val server = gattServer
         if (server == null) {
-            Log.w("BlePeripheral", "sendNotificationData skipped: gattServer is null, payloadLength=${payload.size}")
+            flushingDevices.remove(address)
+            Log.w("BlePeripheral", "flushPendingPayloads skipped: gattServer is null")
             return
         }
         val char = characteristic
         if (char == null) {
-            Log.w("BlePeripheral", "sendNotificationData skipped: characteristic is null, payloadLength=${payload.size}")
+            flushingDevices.remove(address)
+            Log.w("BlePeripheral", "flushPendingPayloads skipped: characteristic is null")
             return
         }
 
         kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            var retryDelayMs: Long? = null
             try {
                 sendMutex.withLock {
-                    // 发送开始标记
-                    if (!sendChunkWithRetry(server, device, char, byteArrayOf(0x00, 0x01, 0x02, 0x03))) return@withLock
-
-                    // 分片发送数据
-                    // 限制最大为 500 避免 Android 底层蓝牙栈的 513 字节缓冲区溢出崩溃
-                    val chunkSize = minOf(500, maxOf(20, currentMtu - 3))
-                    var offset = 0
-                    while (offset < payload.size) {
-                        val length = minOf(chunkSize, payload.size - offset)
-                        val chunk = payload.copyOfRange(offset, offset + length)
-                        if (!sendChunkWithRetry(server, device, char, chunk)) return@withLock
-                        offset += length
+                    val queue = pendingPayloads[address] ?: return@withLock
+                    while (true) {
+                        val nextPayload = queue.pollFirst() ?: break
+                        if (connectedDevice?.address != address || !subscribedDevices.contains(address)) {
+                            queue.offerFirst(nextPayload)
+                            schedulePendingPayloadTimeout(address)
+                            retryDelayMs = PENDING_SEND_RETRY_DELAY_MS
+                            Log.w("BlePeripheral", "发送队列暂停：连接或订阅已失效 address=$address pending=${queue.size}")
+                            break
+                        }
+                        if (!sendPayloadLocked(server, device, char, nextPayload)) {
+                            queue.offerFirst(nextPayload)
+                            schedulePendingPayloadTimeout(address)
+                            retryDelayMs = PENDING_SEND_RETRY_DELAY_MS
+                            Log.w("BlePeripheral", "发送队列暂停：当前 payload 发送失败 address=$address pending=${queue.size}")
+                            break
+                        }
                     }
-
-                    // 发送结束标记
-                    sendChunkWithRetry(server, device, char, byteArrayOf(0xFF.toByte(), 0xFE.toByte(), 0xFD.toByte(), 0xFC.toByte()))
+                    if (queue.isEmpty()) {
+                        pendingPayloads.remove(address)
+                        cancelPendingPayloadTimeout(address)
+                    }
                 }
             } catch (e: Exception) {
-                Log.e("BlePeripheral", "分包发送失败", e)
+                Log.e("BlePeripheral", "发送队列处理失败", e)
                 pendingNotificationAck = null
+            } finally {
+                flushingDevices.remove(address)
+                val hasMore = (pendingPayloads[address]?.isNotEmpty() == true)
+                if (hasMore && connectedDevice?.address == address && subscribedDevices.contains(address)) {
+                    val delayMs = retryDelayMs
+                    if (delayMs == null) {
+                        handler.post { flushPendingPayloads(device) }
+                    } else {
+                        handler.postDelayed({ flushPendingPayloads(device) }, delayMs)
+                    }
+                }
             }
         }
+    }
+
+    private suspend fun sendPayloadLocked(
+        server: BluetoothGattServer,
+        device: BluetoothDevice,
+        char: BluetoothGattCharacteristic,
+        payload: ByteArray
+    ): Boolean {
+        // 发送开始标记
+        if (!sendChunkWithRetry(server, device, char, byteArrayOf(0x00, 0x01, 0x02, 0x03))) return false
+
+        // 分片发送数据：限制最大为 500，避免 Android 底层蓝牙栈的 513 字节缓冲区溢出崩溃。
+        val chunkSize = minOf(500, maxOf(20, currentMtu - 3))
+        var offset = 0
+        while (offset < payload.size) {
+            val length = minOf(chunkSize, payload.size - offset)
+            val chunk = payload.copyOfRange(offset, offset + length)
+            if (!sendChunkWithRetry(server, device, char, chunk)) return false
+            offset += length
+        }
+
+        // 发送结束标记
+        return sendChunkWithRetry(
+            server,
+            device,
+            char,
+            byteArrayOf(0xFF.toByte(), 0xFE.toByte(), 0xFD.toByte(), 0xFC.toByte())
+        )
     }
 
     private suspend fun sendChunkWithRetry(
@@ -571,13 +660,17 @@ actual class BlePeripheral actual constructor() {
     }
 
     @SuppressLint("MissingPermission")
-    private fun closeGattServer(reason: String) {
+    private fun closeGattServer(reason: String, clearQueuedPayloads: Boolean = true) {
         pendingNotificationAck?.complete(BluetoothGatt.GATT_FAILURE)
         pendingNotificationAck = null
-        cancelPendingSendRetries()
+        clearAllSubscriptionWatchdogs()
+        if (clearQueuedPayloads) {
+            clearAllPendingPayloads()
+        }
         connectedDevice = null
         subscribedDevices.clear()
         writeBuffers.clear()
+        peerLabels.clear()
         currentMtu = 23
         try {
             gattServer?.clearServices()
@@ -613,13 +706,121 @@ actual class BlePeripheral actual constructor() {
         Log.i("BlePeripheral", "$reason，${delay}ms 后重启广播")
     }
 
+    private fun enqueuePendingPayload(address: String, payload: ByteArray) {
+        val queue = pendingPayloads.computeIfAbsent(address) {
+            java.util.concurrent.LinkedBlockingDeque()
+        }
+        enqueueBounded(queue, payload)
+    }
+
+    private fun enqueueOrphanPayload(payload: ByteArray) {
+        enqueueBounded(orphanPendingPayloads, payload)
+    }
+
+    private fun enqueueBounded(queue: java.util.concurrent.LinkedBlockingDeque<ByteArray>, payload: ByteArray) {
+        while (queue.size >= MAX_PENDING_PAYLOADS_PER_DEVICE) {
+            queue.pollFirst()
+        }
+        queue.offerLast(payload)
+    }
+
+    private fun mergeOrphanPayloads(address: String) {
+        if (orphanPendingPayloads.isEmpty()) return
+        val queue = pendingPayloads.computeIfAbsent(address) {
+            java.util.concurrent.LinkedBlockingDeque()
+        }
+        var moved = 0
+        while (true) {
+            val payload = orphanPendingPayloads.pollFirst() ?: break
+            enqueueBounded(queue, payload)
+            moved += 1
+        }
+        if (moved > 0) {
+            schedulePendingPayloadTimeout(address)
+            Log.i("BlePeripheral", "已转移未绑定待发送队列到当前连接 address=$address moved=$moved pending=${queue.size}")
+        }
+    }
+
+    private fun movePendingPayloadsToOrphan(address: String) {
+        val queue = pendingPayloads.remove(address)
+        cancelPendingPayloadTimeout(address)
+        flushingDevices.remove(address)
+        var moved = 0
+        while (true) {
+            val payload = queue?.pollFirst() ?: break
+            enqueueOrphanPayload(payload)
+            moved += 1
+        }
+        if (moved > 0) {
+            Log.i("BlePeripheral", "连接断开，待发送队列转入临时队列 address=$address moved=$moved orphanPending=${orphanPendingPayloads.size}")
+        }
+    }
+
+    private fun schedulePendingPayloadTimeout(address: String) {
+        if (pendingPayloads[address].isNullOrEmpty()) return
+
+        val timeout = Runnable {
+            pendingPayloadTimeouts.remove(address)
+            val dropped = pendingPayloads.remove(address)?.size ?: 0
+            if (dropped > 0) {
+                Log.w("BlePeripheral", "等待中心设备订阅超时，丢弃待发送队列 address=$address dropped=$dropped")
+            }
+        }
+        val existing = pendingPayloadTimeouts.putIfAbsent(address, timeout)
+        if (existing == null) {
+            handler.postDelayed(timeout, PENDING_SUBSCRIPTION_TIMEOUT_MS)
+        }
+    }
+
+    private fun cancelPendingPayloadTimeout(address: String) {
+        pendingPayloadTimeouts.remove(address)?.let { handler.removeCallbacks(it) }
+    }
+
+    private fun clearAllPendingPayloads() {
+        pendingPayloadTimeouts.values.forEach { handler.removeCallbacks(it) }
+        pendingPayloadTimeouts.clear()
+        pendingPayloads.clear()
+        orphanPendingPayloads.clear()
+        flushingDevices.clear()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun scheduleSubscriptionWatchdog(device: BluetoothDevice) {
+        val address = device.address
+        cancelSubscriptionWatchdog(address)
+        val watchdog = Runnable {
+            subscriptionWatchdogs.remove(address)
+            if (connectedDevice?.address == address && !subscribedDevices.contains(address)) {
+                Log.w("BlePeripheral", "中心设备连接后未订阅通知，重置 BLE 连接 address=$address")
+                try {
+                    gattServer?.cancelConnection(device)
+                } catch (e: Exception) {
+                    Log.w("BlePeripheral", "取消未订阅连接失败 address=$address", e)
+                }
+                if (connectedDevice?.address == address) {
+                    connectedDevice = null
+                }
+                subscribedDevices.remove(address)
+                if (advertisingWanted && currentWorkMode != WorkMode.Idle) {
+                    scheduleAdvertisingRestart("中心设备未订阅")
+                }
+            }
+        }
+        subscriptionWatchdogs[address] = watchdog
+        handler.postDelayed(watchdog, SUBSCRIPTION_READY_TIMEOUT_MS)
+    }
+
+    private fun cancelSubscriptionWatchdog(address: String) {
+        subscriptionWatchdogs.remove(address)?.let { handler.removeCallbacks(it) }
+    }
+
+    private fun clearAllSubscriptionWatchdogs() {
+        subscriptionWatchdogs.values.forEach { handler.removeCallbacks(it) }
+        subscriptionWatchdogs.clear()
+    }
+
     private fun cancelAdvertisingRestart() {
         restartAdvertiseRunnable?.let { handler.removeCallbacks(it) }
         restartAdvertiseRunnable = null
-    }
-
-    private fun cancelPendingSendRetries() {
-        pendingSendRunnables.forEach { handler.removeCallbacks(it) }
-        pendingSendRunnables.clear()
     }
 }

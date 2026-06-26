@@ -34,10 +34,14 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.widget.Toast
+import com.suseoaa.castpigeon.BoundDeviceStore
 import com.suseoaa.castpigeon.IClipboardChangeCallback
 import java.net.Inet4Address
 import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.Collections
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 
 class BleForegroundService : Service() {
 
@@ -68,6 +72,7 @@ class BleForegroundService : Service() {
     private var lastCapabilitySentAt = 0L
     private var lastNetworkSignature: String? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val seenControlMessageIds = Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
 
     private val privilegedClipboardCallback = object : IClipboardChangeCallback.Stub() {
         override fun onClipboardChanged(text: String?) {
@@ -113,6 +118,53 @@ class BleForegroundService : Service() {
         }
     }
 
+    private fun buildClipboardPayload(text: String): String {
+        val messageId = UUID.randomUUID().toString()
+        rememberControlMessage(messageId)
+        return "CLIP2|$messageId|2|${localDeviceHashString()}|$text"
+    }
+
+    private fun rememberControlMessage(messageId: String): Boolean {
+        if (messageId.isBlank()) return false
+        val added = seenControlMessageIds.add(messageId)
+        if (seenControlMessageIds.size > 512) {
+            seenControlMessageIds.clear()
+            seenControlMessageIds.add(messageId)
+        }
+        return added
+    }
+
+    private fun localDeviceHashString(): String {
+        return getDeviceHash().joinToString("") { "%02X".format(it) }
+    }
+
+    private fun connectedPeerHash(): String? {
+        val raw = AppConnectionManager.stateMachine.connectedDeviceName.value
+            ?: AppConnectionManager.stateMachine.pairingDeviceName.value
+            ?: return null
+        val parts = raw.split("|")
+        return (parts.getOrNull(1)?.takeIf { it.isNotBlank() } ?: raw.takeIf {
+            it.matches(Regex("^[0-9A-Fa-f]{4,8}$"))
+        })?.uppercase()
+    }
+
+    private fun isNotificationSharingEnabled(hash: String?, defaultEnabled: Boolean = hash == null): Boolean {
+        val normalized = hash?.uppercase() ?: run {
+            android.util.Log.w("CastPigeon", "通知共享判断缺少对端 Hash，按旧行为默认发送")
+            return true
+        }
+        val prefs = getSharedPreferences("CastPigeonPrefs", Context.MODE_PRIVATE)
+        val enabled = prefs.getStringSet("NotificationShareEnabledHashes", emptySet()).orEmpty()
+            .map { it.uppercase() }
+            .toSet()
+        val disabled = prefs.getStringSet("NotificationShareDisabledHashes", emptySet()).orEmpty()
+            .map { it.uppercase() }
+            .toSet()
+        if (disabled.contains(normalized)) return false
+        if (enabled.contains(normalized)) return true
+        return defaultEnabled || getBoundHashes().contains(normalized)
+    }
+
     private fun sendClipboardTextToMac(text: String, source: String) {
         if (text == lastSyncedText) return
 
@@ -128,7 +180,7 @@ class BleForegroundService : Service() {
 
         pendingClipboardTextForMac = null
         lastSyncedText = text
-        val payload = "CLIP|$text"
+        val payload = buildClipboardPayload(text)
         try {
             AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
             dbHelper.insertClipboardHistory(text, "sent_to_mac")
@@ -169,7 +221,7 @@ class BleForegroundService : Service() {
         }
 
         pendingClipboardTextForMac = null
-        val payload = "CLIP|$text"
+        val payload = buildClipboardPayload(text)
         try {
             AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
             dbHelper.insertClipboardHistory(text, "sent_to_mac")
@@ -257,7 +309,7 @@ class BleForegroundService : Service() {
                 }
 
                 if (!text.isNullOrEmpty()) {
-                    val payload = "CLIP|$text"
+                    val payload = buildClipboardPayload(text)
                     try {
                         AppConnectionManager.blePeripheral.sendNotificationData(payload.encodeToByteArray())
                         dbHelper.insertClipboardHistory(text, "sent_to_mac")
@@ -317,6 +369,13 @@ class BleForegroundService : Service() {
         super.onCreate()
         dbHelper = MessageDatabaseHelper(this)
         createNotificationChannel()
+        AppConnectionManager.blePeripheral.onPeerAuthorizationRequested = { peerName, peerHash ->
+            BoundDeviceStore.authorizeOrMigratePeer(this, peerName, peerHash).also { accepted ->
+                if (accepted) {
+                    AppConnectionManager.blePeripheral.updateTrustedPeerHashes(getBoundHashes())
+                }
+            }
+        }
         
         val filter = IntentFilter().apply {
             addAction("com.suseoaa.castpigeon.ACTION_SYNC_CLIPBOARD")
@@ -359,6 +418,7 @@ class BleForegroundService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         isObserving = false
+        AppConnectionManager.blePeripheral.onPeerAuthorizationRequested = null
         try {
             unregisterReceiver(clipboardSyncReceiver)
         } catch (e: Exception) { }
@@ -459,18 +519,29 @@ class BleForegroundService : Service() {
                 dbHelper.insertMessage(message)
                 updateNotification()
 
-                // 如果符合发送条件，则通过蓝牙发送
-                if (role == DeviceRole.Sender && workMode == WorkMode.Working && connectionState == ConnectionState.Transferring) {
-                    try {
-                        val jsonStr = encodeNotificationForBle(message) ?: run {
-                            android.util.Log.w("CastPigeon", "通知过长且无法压缩到 BLE 安全范围，已跳过: ${message.title}")
+                if (role == DeviceRole.Sender && workMode == WorkMode.Working) {
+                    val lanJson = Json.encodeToString(message)
+                    sendNotificationToReachableMacs(lanJson, message.title)
+
+                    if (connectionState == ConnectionState.Transferring) {
+                        val peerHash = connectedPeerHash()
+                        if (!isNotificationSharingEnabled(peerHash, defaultEnabled = true)) {
+                            android.util.Log.i("CastPigeon", "通知共享未开启，跳过 BLE 发送到对端: peerHash=$peerHash title=${message.title}")
                             return@collect
                         }
-                        android.util.Log.i("CastPigeon", "发送 BLE 通知: bytes=${jsonStr.encodeToByteArray().size}, title=${message.title}")
-                        AppConnectionManager.crypto.computeSharedSecret(AppConnectionManager.crypto.getPublicKeyBytes())
-                        AppConnectionManager.blePeripheral.sendNotificationData(jsonStr.encodeToByteArray())
-                    } catch (e: Exception) {
-                        e.printStackTrace()
+                        try {
+                            val jsonStr = encodeNotificationForBle(message) ?: run {
+                                android.util.Log.w("CastPigeon", "通知过长且无法压缩到 BLE 安全范围，仅保留 LAN 发送: ${message.title}")
+                                return@collect
+                            }
+                            android.util.Log.i("CastPigeon", "发送 BLE 通知: bytes=${jsonStr.encodeToByteArray().size}, title=${message.title}")
+                            AppConnectionManager.crypto.computeSharedSecret(AppConnectionManager.crypto.getPublicKeyBytes())
+                            AppConnectionManager.blePeripheral.sendNotificationData(jsonStr.encodeToByteArray())
+                        } catch (e: Exception) {
+                            android.util.Log.e("CastPigeon", "发送 BLE 通知失败", e)
+                        }
+                    } else {
+                        android.util.Log.i("CastPigeon", "BLE 未进入 Transferring，已仅尝试 LAN 通知: state=$connectionState title=${message.title}")
                     }
                 }
             }
@@ -478,7 +549,9 @@ class BleForegroundService : Service() {
 
         // 监听来自 Mac 的直接消息 (例如剪贴板)
         val handleMessage: (String) -> Unit = { msg ->
-            if (msg.startsWith("CLIP|")) {
+            if (msg.startsWith("CLIP2|")) {
+                handleClipboardV2(msg)
+            } else if (msg.startsWith("CLIP|")) {
                 val text = msg.substring(5)
                 lastSyncedText = text // 防止回环触发
                 dbHelper.insertClipboardHistory(text, "received_from_mac")
@@ -490,8 +563,16 @@ class BleForegroundService : Service() {
                     android.util.Log.e("CastPigeon", "收到 Mac 剪贴板但直接写入失败，未拉起空白页面")
                 }
             } else if (msg.startsWith("CAP|")) {
-                handlePeerCapability(msg)
+                parsePeerCapability(msg)?.let { capability ->
+                    handlePeerCapability(capability, allowIntroducedPeer = false, rawPayload = msg)
+                    sharePeerCapability(capability, ttl = 2)
+                    shareKnownPeerCapabilities(excludingHash = capability.hash)
+                }
                 sendLocalCapabilityOverBle("收到对端能力信息后回送")
+            } else if (msg.startsWith("CAP_PEER|")) {
+                handlePeerIntroduction(msg)
+            } else if (msg.startsWith("CAP_LOST2|")) {
+                handleCapabilityLostV2(msg)
             } else if (msg.startsWith("CAP_LOST|")) {
                 handleCapabilityLost(msg)
             } else {
@@ -509,6 +590,7 @@ class BleForegroundService : Service() {
 
                 if (state == ConnectionState.Transferring) {
                     sendLocalCapabilityOverBle("BLE 连接就绪")
+                    shareKnownPeerCapabilities()
                     flushPendingClipboardToMacIfReady("BLE 连接就绪")
                 }
 
@@ -563,8 +645,7 @@ class BleForegroundService : Service() {
     }
 
     private fun getBoundEntries(): Set<String> {
-        val prefs = getSharedPreferences("CastPigeonPrefs", Context.MODE_PRIVATE)
-        return prefs.getStringSet("BoundMacs", emptySet()).orEmpty()
+        return BoundDeviceStore.getEntries(this)
     }
 
     private fun isTrustedBoundDeviceName(deviceName: String): Boolean {
@@ -583,12 +664,7 @@ class BleForegroundService : Service() {
     }
 
     private fun getBoundHashes(): Set<String> {
-        return getBoundEntries().mapNotNull { entry ->
-            val parts = entry.split("|")
-            (parts.getOrNull(1)?.takeIf { it.isNotBlank() }
-                ?: entry.takeIf { it.matches(Regex("^[0-9A-Fa-f]{4,8}$")) })
-                ?.uppercase()
-        }.toSet()
+        return BoundDeviceStore.getHashes(this)
     }
 
     private fun getBoundTargetHashes(): Set<ByteArray> {
@@ -601,6 +677,78 @@ class BleForegroundService : Service() {
                 hash.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
             }.getOrNull()
         }.toSet()
+    }
+
+    private data class LanNotificationTarget(
+        val deviceName: String,
+        val hash: String,
+        val ipAddress: String,
+        val filePort: Int
+    )
+
+    private suspend fun sendNotificationToReachableMacs(payload: String, title: String): Boolean {
+        val targets = buildLanNotificationTargets()
+
+        if (targets.isEmpty()) {
+            android.util.Log.i("CastPigeon", "没有可用的 LAN Mac 目标，跳过 LAN 通知: $title")
+            return false
+        }
+
+        var anySuccess = false
+        for (target in targets) {
+            val success = LanFileTransferManager.sendNotification(
+                targetIp = target.ipAddress,
+                targetPort = target.filePort,
+                deviceHash = localDeviceHashString(),
+                payload = payload
+            )
+            if (success) {
+                anySuccess = true
+                android.util.Log.i("CastPigeon", "LAN 通知发送成功: target=${target.deviceName} ${target.hash}, title=$title")
+            }
+        }
+        return anySuccess
+    }
+
+    private fun buildLanNotificationTargets(): List<LanNotificationTarget> {
+        val discoveredTargets = UdpDiscovery.discoveredDevices.value
+            .asSequence()
+            .filter { it.deviceType.equals("Mac", ignoreCase = true) }
+            .mapNotNull { device ->
+                val port = device.filePort ?: return@mapNotNull null
+                if (device.ipAddress.isBlank()) return@mapNotNull null
+                LanNotificationTarget(
+                    deviceName = device.deviceName,
+                    hash = device.hash.uppercase(),
+                    ipAddress = device.ipAddress,
+                    filePort = port
+                )
+            }
+
+        val cachedBoundTargets = BoundDeviceStore.getEntries(this)
+            .asSequence()
+            .map(BoundDeviceStore::parse)
+            .filter {
+                it.deviceType.equals("Mac", ignoreCase = true) ||
+                    it.deviceType.equals("Unknown", ignoreCase = true)
+            }
+            .mapNotNull { entry ->
+                val hash = entry.hash?.uppercase() ?: return@mapNotNull null
+                val ip = entry.lastIp?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val port = entry.filePort?.toIntOrNull()?.takeIf { it > 0 } ?: return@mapNotNull null
+                LanNotificationTarget(
+                    deviceName = entry.name,
+                    hash = hash,
+                    ipAddress = ip,
+                    filePort = port
+                )
+            }
+
+        return (discoveredTargets + cachedBoundTargets)
+            .filter { it.hash != localDeviceHashString() }
+            .filter { isNotificationSharingEnabled(it.hash, defaultEnabled = true) }
+            .distinctBy { it.hash.uppercase() }
+            .toList()
     }
 
     @android.annotation.SuppressLint("HardwareIds")
@@ -689,6 +837,32 @@ class BleForegroundService : Service() {
         val timestamp: Long
     )
 
+    private fun handleClipboardV2(payload: String) {
+        val parts = payload.split("|", limit = 5)
+        if (parts.size < 5 || parts[0] != "CLIP2") return
+        val messageId = parts[1]
+        if (!rememberControlMessage(messageId)) return
+        val ttl = parts[2].toIntOrNull() ?: 0
+        val originHash = parts[3].uppercase()
+        val text = parts[4]
+        if (originHash == localDeviceHashString()) return
+
+        lastSyncedText = text
+        dbHelper.insertClipboardHistory(text, "received_from_group")
+
+        val handled = writeClipboardDirectly(text, "组内剪贴板同步")
+            || writeClipboardViaPrivilege(text, "组内剪贴板同步")
+
+        if (!handled) {
+            android.util.Log.e("CastPigeon", "收到组内剪贴板但直接写入失败")
+        }
+
+        if (ttl > 0) {
+            val forwarded = "CLIP2|$messageId|${ttl - 1}|$originHash|$text"
+            sendControlPayloadOverBle(forwarded)
+        }
+    }
+
     private fun sendLocalCapabilityOverBle(reason: String, force: Boolean = false) {
         val now = System.currentTimeMillis()
         if (!force && now - lastCapabilitySentAt < 2_000) return
@@ -724,8 +898,9 @@ class BleForegroundService : Service() {
     }
 
     private fun sendCapabilityLost(reason: String) {
-        val deviceHash = getDeviceHash().joinToString("") { "%02X".format(it) }
-        val payload = "CAP_LOST|$deviceHash|$reason|${System.currentTimeMillis()}"
+        val messageId = UUID.randomUUID().toString()
+        rememberControlMessage(messageId)
+        val payload = "CAP_LOST2|$messageId|2|${localDeviceHashString()}|$reason|${System.currentTimeMillis()}"
         try {
             sendControlPayloadOverBle(payload)
             android.util.Log.i("CastPigeon", "$reason 已发送网络断开信息: $payload")
@@ -742,12 +917,16 @@ class BleForegroundService : Service() {
         }
     }
 
-    private fun handlePeerCapability(payload: String) {
-        val capability = parsePeerCapability(payload) ?: return
+    private fun handlePeerCapability(
+        capability: PeerNetworkCapability,
+        allowIntroducedPeer: Boolean,
+        rawPayload: String
+    ) {
         val local = getLocalNetworkCapability()
-        if (capability.hash == getDeviceHash().joinToString("") { "%02X".format(it) }) return
+        if (capability.hash.equals(localDeviceHashString(), ignoreCase = true)) return
         val boundHashes = getBoundHashes()
         if (AppConnectionManager.stateMachine.workMode.value == WorkMode.Working &&
+            !allowIntroducedPeer &&
             boundHashes.isNotEmpty() &&
             !boundHashes.contains(capability.hash.uppercase())
         ) {
@@ -764,6 +943,16 @@ class BleForegroundService : Service() {
             val sameLan = local != null && isSameLan(local, capability)
             val reachable = sameLan && canConnectTo(capability.ip, capability.filePort)
             if (reachable) {
+                if (capability.deviceType.equals("Mac", ignoreCase = true)) {
+                    BoundDeviceStore.updateNetworkInfo(
+                        context = this@BleForegroundService,
+                        peerHash = capability.hash,
+                        peerName = capability.deviceName,
+                        deviceType = capability.deviceType,
+                        ip = capability.ip,
+                        filePort = capability.filePort
+                    )
+                }
                 UdpDiscovery.upsertDiscoveredDevice(
                     UdpDevice(
                         deviceName = capability.deviceName,
@@ -779,11 +968,87 @@ class BleForegroundService : Service() {
                         lastSeen = capability.timestamp
                     )
                 )
-                android.util.Log.i("CastPigeon", "对端 LAN 可达，已更新在线设备: $payload")
+                android.util.Log.i("CastPigeon", "对端 LAN 可达，已更新在线设备: $rawPayload")
             } else {
                 UdpDiscovery.removeDiscoveredDevice(capability.hash)
-                android.util.Log.i("CastPigeon", "对端 LAN 不可达，已从在线设备移除: sameLan=$sameLan, payload=$payload")
+                android.util.Log.i("CastPigeon", "对端 LAN 不可达，已从在线设备移除: sameLan=$sameLan, payload=$rawPayload")
             }
+        }
+    }
+
+    private fun sharePeerCapability(capability: PeerNetworkCapability, ttl: Int, messageId: String = UUID.randomUUID().toString()) {
+        if (ttl <= 0) return
+        if (capability.hash.equals(localDeviceHashString(), ignoreCase = true)) return
+        if (!seenControlMessageIds.contains(messageId)) {
+            rememberControlMessage(messageId)
+        }
+        val payload = listOf(
+            "CAP_PEER",
+            "2",
+            messageId,
+            ttl.toString(),
+            localDeviceHashString(),
+            capability.deviceName,
+            capability.hash,
+            capability.deviceType,
+            capability.ip,
+            capability.prefixLength?.toString().orEmpty(),
+            capability.gateway.orEmpty(),
+            capability.filePort?.toString().orEmpty(),
+            capability.networkId.orEmpty(),
+            capability.timestamp.toString()
+        ).joinToString("|")
+        try {
+            sendControlPayloadOverBle(payload)
+            android.util.Log.i("CastPigeon", "已转发组内设备能力: ${capability.deviceName} ${capability.hash}, ttl=$ttl")
+        } catch (e: Exception) {
+            android.util.Log.w("CastPigeon", "转发组内设备能力失败: ${capability.hash}", e)
+        }
+    }
+
+    private fun shareKnownPeerCapabilities(excludingHash: String? = null) {
+        val excluded = setOfNotNull(excludingHash?.uppercase(), localDeviceHashString().uppercase())
+        UdpDiscovery.discoveredDevices.value
+            .filter { it.hash.uppercase() !in excluded }
+            .filter { it.lanReachable && it.ipAddress.isNotBlank() && it.filePort != null }
+            .forEach { device ->
+                sharePeerCapability(
+                    capability = PeerNetworkCapability(
+                        deviceName = device.deviceName,
+                        hash = device.hash,
+                        deviceType = device.deviceType,
+                        ip = device.ipAddress,
+                        prefixLength = device.prefixLength,
+                        gateway = device.gateway,
+                        filePort = device.filePort,
+                        networkId = device.networkId,
+                        timestamp = device.lastSeen.takeIf { it > 0 } ?: System.currentTimeMillis()
+                    ),
+                    ttl = 2
+                )
+            }
+    }
+
+    private fun handlePeerIntroduction(payload: String) {
+        val parts = payload.split("|")
+        if (parts.size < 14 || parts[0] != "CAP_PEER" || parts[1] != "2") return
+        val messageId = parts[2]
+        if (!rememberControlMessage(messageId)) return
+        val ttl = parts[3].toIntOrNull() ?: 0
+        val capability = PeerNetworkCapability(
+            deviceName = parts[5],
+            hash = parts[6],
+            deviceType = parts[7].ifBlank { "Unknown" },
+            ip = parts[8],
+            prefixLength = parts[9].toIntOrNull(),
+            gateway = parts[10].ifBlank { null },
+            filePort = parts[11].toIntOrNull(),
+            networkId = parts[12].ifBlank { null },
+            timestamp = parts[13].toLongOrNull() ?: System.currentTimeMillis()
+        )
+        handlePeerCapability(capability, allowIntroducedPeer = true, rawPayload = payload)
+        if (ttl > 0) {
+            sharePeerCapability(capability, ttl = ttl - 1, messageId = messageId)
         }
     }
 
@@ -821,9 +1086,24 @@ class BleForegroundService : Service() {
     private fun handleCapabilityLost(payload: String) {
         val parts = payload.split("|")
         val hash = parts.getOrNull(1) ?: return
-        if (hash == getDeviceHash().joinToString("") { "%02X".format(it) }) return
+        if (hash.equals(localDeviceHashString(), ignoreCase = true)) return
         UdpDiscovery.removeDiscoveredDevice(hash)
         android.util.Log.i("CastPigeon", "收到对端网络断开，已移除在线设备: $payload")
+    }
+
+    private fun handleCapabilityLostV2(payload: String) {
+        val parts = payload.split("|", limit = 6)
+        if (parts.size < 6 || parts[0] != "CAP_LOST2") return
+        val messageId = parts[1]
+        if (!rememberControlMessage(messageId)) return
+        val ttl = parts[2].toIntOrNull() ?: 0
+        val hash = parts[3]
+        if (hash.equals(localDeviceHashString(), ignoreCase = true)) return
+        UdpDiscovery.removeDiscoveredDevice(hash)
+        android.util.Log.i("CastPigeon", "收到组内网络断开，已移除在线设备: $payload")
+        if (ttl > 0) {
+            sendControlPayloadOverBle("CAP_LOST2|$messageId|${ttl - 1}|$hash|${parts[4]}|${parts[5]}")
+        }
     }
 
     private fun getLocalNetworkCapability(): LocalNetworkCapability? {

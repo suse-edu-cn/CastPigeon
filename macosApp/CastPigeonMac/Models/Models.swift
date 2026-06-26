@@ -91,7 +91,8 @@ class DatabaseManager {
         sqlite3_finalize(createTableStatement)
     }
     
-    func insertMessage(_ msg: NotificationMessage, deviceHash: String) {
+    @discardableResult
+    func insertMessage(_ msg: NotificationMessage, deviceHash: String) -> Bool {
         // Handle Icon storage logic
         if let base64 = msg.iconBase64, !base64.isEmpty {
             let iconPath = (iconsDir as NSString).appendingPathComponent("\(msg.appName).png")
@@ -104,6 +105,7 @@ class DatabaseManager {
         
         let insertStatementString = "INSERT OR IGNORE INTO messages (id, deviceHash, appName, title, content, timestamp) VALUES (?, ?, ?, ?, ?, ?);"
         var insertStatement: OpaquePointer?
+        var didInsert = false
         if sqlite3_prepare_v2(db, insertStatementString, -1, &insertStatement, nil) == SQLITE_OK {
             sqlite3_bind_text(insertStatement, 1, (msg.id as NSString).utf8String, -1, nil)
             sqlite3_bind_text(insertStatement, 2, (deviceHash as NSString).utf8String, -1, nil)
@@ -113,7 +115,12 @@ class DatabaseManager {
             sqlite3_bind_int64(insertStatement, 6, msg.timestamp)
             
             if sqlite3_step(insertStatement) == SQLITE_DONE {
-                print("Successfully inserted row.")
+                didInsert = sqlite3_changes(db) > 0
+                if didInsert {
+                    print("Successfully inserted row.")
+                } else {
+                    print("Duplicate row ignored.")
+                }
             } else {
                 print("Could not insert row.")
             }
@@ -121,6 +128,7 @@ class DatabaseManager {
             print("INSERT statement could not be prepared.")
         }
         sqlite3_finalize(insertStatement)
+        return didInsert
     }
     
     func getMessages(for deviceHash: String? = nil) -> [NotificationMessage] {

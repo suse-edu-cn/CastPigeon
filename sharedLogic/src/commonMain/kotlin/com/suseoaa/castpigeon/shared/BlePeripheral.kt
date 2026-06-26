@@ -28,6 +28,11 @@ expect class BlePeripheral() {
     fun updateTrustedPeerHashes(hashes: Set<String>)
 
     /**
+     * 工作模式下，当对端 Hash 不在当前信任列表时，给上层一次迁移旧绑定的机会。
+     */
+    var onPeerAuthorizationRequested: ((String, String) -> Boolean)?
+
+    /**
 *停止发送广播。
 *
 *当进入连接状态或主动回退至静默期时调用。

@@ -177,6 +177,39 @@ object LanFileTransferManager {
         }
     }
 
+    suspend fun sendNotification(
+        targetIp: String,
+        targetPort: Int,
+        deviceHash: String,
+        payload: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        val url = URL("http://$targetIp:$targetPort/notification")
+        val body = payload.encodeToByteArray()
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 3_000
+            readTimeout = 8_000
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            setRequestProperty("X-CastPigeon-Device-Hash", deviceHash)
+            setRequestProperty("Content-Length", body.size.toString())
+        }
+
+        return@withContext try {
+            BufferedOutputStream(connection.outputStream).use { output ->
+                output.write(body)
+            }
+            val code = connection.responseCode
+            Log.i(TAG, "LAN 通知发送完成: $targetIp:$targetPort, code=$code")
+            code in 200..299
+        } catch (e: Exception) {
+            Log.w(TAG, "LAN 通知发送失败: $targetIp:$targetPort", e)
+            false
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     private fun handleClient(context: Context, client: java.net.Socket) {
         client.use { socket ->
             val input = BufferedInputStream(socket.getInputStream())

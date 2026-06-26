@@ -352,6 +352,13 @@ struct DevicesView: View {
                                         showRenameSheet = true
                                     }
                                     .buttonStyle(.bordered)
+
+                                    Toggle("通知", isOn: Binding(
+                                        get: { viewModel.isNotificationSharingEnabled(hash: hash, defaultEnabled: true) },
+                                        set: { viewModel.setNotificationSharing(hash: hash, enabled: $0) }
+                                    ))
+                                    .toggleStyle(.switch)
+                                    .controlSize(.small)
                                     
                                     Button("解绑") {
                                         withAnimation { viewModel.unbindDevice(hash: hash) }
@@ -446,6 +453,22 @@ struct DevicesView: View {
                                             .foregroundColor(.secondary)
                                     }
                                     Spacer()
+                                    Toggle("通知", isOn: Binding(
+                                        get: {
+                                            viewModel.isNotificationSharingEnabled(
+                                                hash: device.hash_,
+                                                defaultEnabled: viewModel.boundDeviceHashes.contains { entry in
+                                                    let parts = entry.components(separatedBy: "|")
+                                                    let hash = parts.count > 1 ? parts[1] : entry
+                                                    return hash.caseInsensitiveCompare(device.hash_) == .orderedSame
+                                                }
+                                            )
+                                        },
+                                        set: { viewModel.setNotificationSharing(hash: device.hash_, enabled: $0) }
+                                    ))
+                                    .toggleStyle(.switch)
+                                    .controlSize(.small)
+
                                     Button("发送文件") {
                                         let panel = NSOpenPanel()
                                         panel.canChooseFiles = true

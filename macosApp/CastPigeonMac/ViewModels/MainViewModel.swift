@@ -39,6 +39,8 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     @Published var connectedDeviceHashes: Set<String> = []
     @Published var udpDevices: [UdpDevice] = []
     @Published var fileTransferStatus: LanFileTransferManager.TransferStatus? = nil
+    @Published var notificationShareEnabledHashes: [String] = UserDefaults.standard.stringArray(forKey: "NotificationShareEnabledHashes") ?? []
+    @Published var notificationShareDisabledHashes: [String] = UserDefaults.standard.stringArray(forKey: "NotificationShareDisabledHashes") ?? []
     
     @Published var showPinDisplay: Bool = false
     @Published var displayPin: String = ""
@@ -54,9 +56,12 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     private var connectingDeviceHashes: Set<String> = []
     private var pendingConnectionPeripherals: [String: CBPeripheral] = [:]
     private var pendingConnectionLogAt: [String: Date] = [:]
+    private var recentNotificationKeys: [String: Date] = [:]
+    private let notificationDedupWindow: TimeInterval = 120
     private var serviceRediscoveryAttempts: [UUID: Int] = [:]
     private var serviceRediscoveryResetWorkItems: [UUID: DispatchWorkItem] = [:]
     private var controlCharacteristics: [UUID: CBCharacteristic] = [:]
+    private var seenControlMessageIds: Set<String> = []
     private var isBleScanning: Bool = false
     private var scanRestartWorkItem: DispatchWorkItem?
     private var connectionTimeoutWorkItems: [UUID: DispatchWorkItem] = [:]
@@ -66,6 +71,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     private let pathMonitor = NWPathMonitor()
     private let pathMonitorQueue = DispatchQueue(label: "CastPigeon.NetworkMonitor")
     private var lastNetworkSignature: String? = nil
+    private lazy var stableLocalHash: String = Self.loadOrCreateLocalDeviceHash()
     
     // Server state
     private var gattCharacteristic: CBMutableCharacteristic?
@@ -141,6 +147,9 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     override init() {
         super.init()
         LanFileTransferManager.shared.startServer()
+        LanFileTransferManager.shared.onNotificationPayloadReceived = { [weak self] data, deviceHash in
+            self?.showNotification(from: data, deviceHash: deviceHash)
+        }
         centralManager = CBCentralManager(delegate: self, queue: nil)
         peripheralManager = CBPeripheralManager(delegate: self, queue: nil)
         
@@ -171,9 +180,23 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     }
     
     var myHash: String {
-        let name = Host.current().localizedName ?? "Mac"
-        let hash = abs(name.hashValue) % 10000
-        return String(format: "%04X", hash)
+        stableLocalHash
+    }
+
+    private static func loadOrCreateLocalDeviceHash() -> String {
+        let key = "LocalDeviceHash"
+        if let saved = UserDefaults.standard.string(forKey: key)?.uppercased(),
+           saved.range(of: #"^[0-9A-F]{4,8}$"#, options: .regularExpression) != nil {
+            return saved
+        }
+
+        let generated = UUID().uuidString
+            .replacingOccurrences(of: "-", with: "")
+            .prefix(8)
+            .uppercased()
+        let hash = String(generated)
+        UserDefaults.standard.set(hash, forKey: key)
+        return hash
     }
 
     private var localCapabilityPayload: String {
@@ -226,6 +249,32 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
             }
             UserDefaults.standard.set(boundDeviceHashes, forKey: "BoundDeviceHashes")
         }
+    }
+
+    func isNotificationSharingEnabled(hash: String, defaultEnabled: Bool? = nil) -> Bool {
+        let normalized = hash.uppercased()
+        if notificationShareDisabledHashes.contains(where: { $0.caseInsensitiveCompare(normalized) == .orderedSame }) {
+            return false
+        }
+        if notificationShareEnabledHashes.contains(where: { $0.caseInsensitiveCompare(normalized) == .orderedSame }) {
+            return true
+        }
+        return defaultEnabled ?? isBoundDeviceHash(normalized)
+    }
+
+    func setNotificationSharing(hash: String, enabled: Bool) {
+        let normalized = hash.uppercased()
+        notificationShareEnabledHashes.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
+        notificationShareDisabledHashes.removeAll { $0.caseInsensitiveCompare(normalized) == .orderedSame }
+        if enabled {
+            notificationShareEnabledHashes.append(normalized)
+        } else {
+            notificationShareDisabledHashes.append(normalized)
+        }
+        notificationShareEnabledHashes = Array(Set(notificationShareEnabledHashes.map { $0.uppercased() })).sorted()
+        notificationShareDisabledHashes = Array(Set(notificationShareDisabledHashes.map { $0.uppercased() })).sorted()
+        UserDefaults.standard.set(notificationShareEnabledHashes, forKey: "NotificationShareEnabledHashes")
+        UserDefaults.standard.set(notificationShareDisabledHashes, forKey: "NotificationShareDisabledHashes")
     }
 
     func start(mode: WorkMode) {
@@ -389,6 +438,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
             }
             updateState(name: "Transferring", desc: "手机已连接并订阅通知，可以发送消息了。")
             sendLocalCapability(reason: "手机订阅通知")
+            shareKnownPeerCapabilities()
         }
     }
 
@@ -408,6 +458,11 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         guard peripheral === peripheralManager else { return }
         for request in requests {
             if request.characteristic.uuid == handshakeCharUuid {
+                if let data = request.value, let text = String(data: data, encoding: .utf8), text.hasPrefix("CLIP2|") {
+                    handleClipboardV2(text)
+                    peripheralManager.respond(to: request, withResult: .success)
+                    return
+                }
                 if let data = request.value, let text = String(data: data, encoding: .utf8), text.hasPrefix("CLIP|") {
                     let clipText = String(text.dropFirst(5))
                     DispatchQueue.main.async {
@@ -418,6 +473,16 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
                 }
                 if let data = request.value, let text = String(data: data, encoding: .utf8), text.hasPrefix("CAP|") {
                     handleCapabilityPayload(text)
+                    peripheralManager.respond(to: request, withResult: .success)
+                    return
+                }
+                if let data = request.value, let text = String(data: data, encoding: .utf8), text.hasPrefix("CAP_PEER|") {
+                    handlePeerIntroduction(text)
+                    peripheralManager.respond(to: request, withResult: .success)
+                    return
+                }
+                if let data = request.value, let text = String(data: data, encoding: .utf8), text.hasPrefix("CAP_LOST2|") {
+                    handleCapabilityLostV2(text)
                     peripheralManager.respond(to: request, withResult: .success)
                     return
                 }
@@ -451,9 +516,26 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
             }
             lastClipboardSentText = text
             lastClipboardSentAt = Date()
-            let payload = "CLIP|" + text
+            let payload = clipboardPayload(text)
             sendClipboardPayload(payload)
         }
+    }
+
+    private func clipboardPayload(_ text: String) -> String {
+        let messageId = UUID().uuidString
+        rememberControlMessage(messageId)
+        return "CLIP2|\(messageId)|2|\(myHash)|\(text)"
+    }
+
+    @discardableResult
+    private func rememberControlMessage(_ messageId: String) -> Bool {
+        guard !messageId.isEmpty else { return false }
+        let inserted = seenControlMessageIds.insert(messageId).inserted
+        if seenControlMessageIds.count > 512 {
+            seenControlMessageIds.removeAll()
+            seenControlMessageIds.insert(messageId)
+        }
+        return inserted
     }
 
     private func applyIncomingClipboardText(_ clipText: String) {
@@ -541,10 +623,33 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         }
     }
 
+    private func handleClipboardV2(_ payload: String) {
+        let parts = payload.components(separatedBy: "|")
+        guard parts.count >= 5, parts[0] == "CLIP2" else { return }
+        let messageId = parts[1]
+        guard rememberControlMessage(messageId) else { return }
+        let ttl = Int(parts[2]) ?? 0
+        let originHash = parts[3].uppercased()
+        if originHash == myHash.uppercased() { return }
+        let text = parts.dropFirst(4).joined(separator: "|")
+
+        applyIncomingClipboardText(text)
+
+        if ttl > 0 {
+            sendControlPayload("CLIP2|\(messageId)|\(ttl - 1)|\(originHash)|\(text)")
+        }
+    }
+
     private func handleCapabilityPayload(_ payload: String) {
         guard let capability = parsePeerCapability(payload) else { return }
+        handlePeerCapability(capability, allowIntroducedPeer: false, rawPayload: payload)
+        sharePeerCapability(capability, ttl: 2)
+        shareKnownPeerCapabilities(excludingHash: capability.hash)
+    }
+
+    private func handlePeerCapability(_ capability: PeerNetworkCapability, allowIntroducedPeer: Bool, rawPayload: String) {
         guard capability.hash != myHash else { return }
-        if workMode == .working && !isBoundDeviceHash(capability.hash) {
+        if workMode == .working && !allowIntroducedPeer && !isBoundDeviceHash(capability.hash) {
             DispatchQueue.main.async {
                 self.udpDevices.removeAll { $0.hash_ == capability.hash }
             }
@@ -593,6 +698,76 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
         }
     }
 
+    private func sharePeerCapability(_ capability: PeerNetworkCapability, ttl: Int, messageId: String = UUID().uuidString) {
+        guard ttl > 0 else { return }
+        guard capability.hash.uppercased() != myHash.uppercased() else { return }
+        if !seenControlMessageIds.contains(messageId) {
+            rememberControlMessage(messageId)
+        }
+        let payload = [
+            "CAP_PEER",
+            "2",
+            messageId,
+            String(ttl),
+            myHash,
+            capability.deviceName,
+            capability.hash,
+            capability.deviceType,
+            capability.ip,
+            capability.prefixLength.map(String.init) ?? "",
+            capability.gateway ?? "",
+            capability.filePort.map(String.init) ?? "",
+            capability.networkId ?? "",
+            String(capability.timestamp)
+        ].joined(separator: "|")
+        sendControlPayload(payload)
+        logDebug("已转发组内设备能力: \(capability.deviceName) \(capability.hash), ttl=\(ttl)")
+    }
+
+    private func shareKnownPeerCapabilities(excludingHash: String? = nil) {
+        let excluded = Set([excludingHash?.uppercased(), myHash.uppercased()].compactMap { $0 })
+        udpDevices
+            .filter { !excluded.contains($0.hash_.uppercased()) }
+            .filter { $0.lanReachable && $0.ip != nil && $0.filePort != nil }
+            .forEach { device in
+                let capability = PeerNetworkCapability(
+                    deviceName: device.deviceName,
+                    hash: device.hash_,
+                    deviceType: device.deviceType,
+                    ip: device.ip ?? "",
+                    prefixLength: device.prefixLength,
+                    gateway: device.gateway,
+                    filePort: device.filePort,
+                    networkId: device.networkId,
+                    timestamp: device.lastSeen > 0 ? device.lastSeen : Int64(Date().timeIntervalSince1970 * 1000)
+                )
+                sharePeerCapability(capability, ttl: 2)
+            }
+    }
+
+    private func handlePeerIntroduction(_ payload: String) {
+        let parts = payload.components(separatedBy: "|")
+        guard parts.count >= 14, parts[0] == "CAP_PEER", parts[1] == "2" else { return }
+        let messageId = parts[2]
+        guard rememberControlMessage(messageId) else { return }
+        let ttl = Int(parts[3]) ?? 0
+        let capability = PeerNetworkCapability(
+            deviceName: parts[5],
+            hash: parts[6],
+            deviceType: parts[7].isEmpty ? "Unknown" : parts[7],
+            ip: parts[8],
+            prefixLength: Int(parts[9]),
+            gateway: parts[10].isEmpty ? nil : parts[10],
+            filePort: Int(parts[11]),
+            networkId: parts[12].isEmpty ? nil : parts[12],
+            timestamp: Int64(parts[13]) ?? Int64(Date().timeIntervalSince1970 * 1000)
+        )
+        handlePeerCapability(capability, allowIntroducedPeer: true, rawPayload: payload)
+        if ttl > 0 {
+            sharePeerCapability(capability, ttl: ttl - 1, messageId: messageId)
+        }
+    }
+
     private func parsePeerCapability(_ payload: String) -> PeerNetworkCapability? {
         let parts = payload.components(separatedBy: "|")
         if parts.count >= 11, parts[0] == "CAP", parts[1] == "2" {
@@ -633,6 +808,25 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
             self.udpDevices.removeAll { $0.hash_ == hash }
         }
         logDebug("收到对端网络断开，已移除在线设备: \(hash)")
+    }
+
+    private func handleCapabilityLostV2(_ payload: String) {
+        let parts = payload.components(separatedBy: "|")
+        guard parts.count >= 6, parts[0] == "CAP_LOST2" else { return }
+        let messageId = parts[1]
+        guard rememberControlMessage(messageId) else { return }
+        let ttl = Int(parts[2]) ?? 0
+        let hash = parts[3]
+        guard hash.uppercased() != myHash.uppercased() else { return }
+        DispatchQueue.main.async {
+            self.udpDevices.removeAll { $0.hash_ == hash }
+        }
+        logDebug("收到组内网络断开，已移除在线设备: \(hash)")
+        if ttl > 0 {
+            let reason = parts[4]
+            let timestamp = parts.dropFirst(5).joined(separator: "|")
+            sendControlPayload("CAP_LOST2|\(messageId)|\(ttl - 1)|\(hash)|\(reason)|\(timestamp)")
+        }
     }
 
     private func localIPv4Address() -> String? {
@@ -790,7 +984,9 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     }
 
     private func sendCapabilityLost(reason: String) {
-        let payload = "CAP_LOST|\(myHash)|\(reason)|\(Int64(Date().timeIntervalSince1970 * 1000))"
+        let messageId = UUID().uuidString
+        rememberControlMessage(messageId)
+        let payload = "CAP_LOST2|\(messageId)|2|\(myHash)|\(reason)|\(Int64(Date().timeIntervalSince1970 * 1000))"
         sendControlPayload(payload)
         logDebug("\(reason)，已发送网络断开信息")
     }
@@ -1246,6 +1442,7 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
             markServiceRediscoveryStable(for: peripheral)
             updateState(name: "Transferring", desc: "通道建立成功，等待消息...")
             sendLocalCapability(reason: "BLE 通道建立")
+            shareKnownPeerCapabilities()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
                 guard let self else { return }
                 if self.pendingConnectionPeripherals.isEmpty {
@@ -1299,11 +1496,17 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
                     receiveBuffers[peripheral.identifier]?.removeAll()
                     if let msg = String(data: completeData, encoding: .utf8) {
                         DispatchQueue.main.async {
-                            if msg.hasPrefix("CLIP|") {
+                            if msg.hasPrefix("CLIP2|") {
+                                self.handleClipboardV2(msg)
+                            } else if msg.hasPrefix("CLIP|") {
                                 let clipText = String(msg.dropFirst(5))
                                 self.applyIncomingClipboardText(clipText)
                             } else if msg.hasPrefix("CAP|") {
                                 self.handleCapabilityPayload(msg)
+                            } else if msg.hasPrefix("CAP_PEER|") {
+                                self.handlePeerIntroduction(msg)
+                            } else if msg.hasPrefix("CAP_LOST2|") {
+                                self.handleCapabilityLostV2(msg)
                             } else if msg.hasPrefix("CAP_LOST|") {
                                 self.handleCapabilityLost(msg)
                             } else {
@@ -1321,13 +1524,25 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
     }
     
     private func showNotification(from data: Data, deviceHash: String) {
+        guard isNotificationSharingEnabled(hash: deviceHash, defaultEnabled: true) else {
+            logDebug("通知共享未开启，已忽略来自 \(deviceHash) 的通知")
+            return
+        }
         do {
             let decoder = JSONDecoder()
             let message = try decoder.decode(NotificationMessage.self, from: data)
+            guard shouldAcceptNotification(message, deviceHash: deviceHash) else {
+                logDebug("重复通知已忽略: \(message.title)")
+                return
+            }
+
+            let inserted = DatabaseManager.shared.insertMessage(message, deviceHash: deviceHash)
+            guard inserted else {
+                logDebug("历史中已存在，跳过系统通知: \(message.title)")
+                return
+            }
+
             logDebug("成功解码通知: \(message.title)")
-            
-            // Insert to database
-            DatabaseManager.shared.insertMessage(message, deviceHash: deviceHash)
             
             let content = UNMutableNotificationContent()
             content.title = message.title
@@ -1359,5 +1574,14 @@ final class MainViewModel: NSObject, ObservableObject, CBCentralManagerDelegate,
             let preview = String(data: data.prefix(160), encoding: .utf8) ?? "<non-utf8>"
             self.logDebug("解码通知失败: \(error.localizedDescription), payload=\(preview)")
         }
+    }
+
+    private func shouldAcceptNotification(_ message: NotificationMessage, deviceHash: String) -> Bool {
+        let now = Date()
+        recentNotificationKeys = recentNotificationKeys.filter { now.timeIntervalSince($0.value) < notificationDedupWindow }
+        let key = "\(deviceHash.uppercased())|\(message.id)"
+        guard recentNotificationKeys[key] == nil else { return false }
+        recentNotificationKeys[key] = now
+        return true
     }
 }

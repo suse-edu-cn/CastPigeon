@@ -50,6 +50,7 @@ import kotlinx.coroutines.withContext
 import java.security.MessageDigest
 import java.util.Date
 import com.suseoaa.castpigeon.AppManager
+import com.suseoaa.castpigeon.BoundDeviceStore
 import com.suseoaa.castpigeon.StartupPermissionCoordinator
 import com.suseoaa.castpigeon.shared.crypto.Crypto
 import kotlinx.serialization.encodeToString
@@ -227,6 +228,43 @@ private fun removeBoundDeviceEntry(
     saveBoundDeviceEntries(prefs, boundMacs, filtered)
 }
 
+private fun normalizedHash(hash: String?): String? = hash?.takeIf { it.isNotBlank() }?.uppercase()
+
+private fun isNotificationSharingEnabled(
+    hash: String?,
+    defaultEnabled: Boolean,
+    enabledHashes: Set<String>,
+    disabledHashes: Set<String>
+): Boolean {
+    val normalized = normalizedHash(hash) ?: return false
+    return when {
+        disabledHashes.contains(normalized) -> false
+        enabledHashes.contains(normalized) -> true
+        else -> defaultEnabled
+    }
+}
+
+private fun updateNotificationSharing(
+    prefs: android.content.SharedPreferences,
+    enabledHashes: SnapshotStateList<String>,
+    disabledHashes: SnapshotStateList<String>,
+    hash: String,
+    enabled: Boolean
+) {
+    val normalized = hash.uppercase()
+    enabledHashes.removeAll { it.equals(normalized, ignoreCase = true) }
+    disabledHashes.removeAll { it.equals(normalized, ignoreCase = true) }
+    if (enabled) {
+        enabledHashes.add(normalized)
+    } else {
+        disabledHashes.add(normalized)
+    }
+    prefs.edit {
+        putStringSet("NotificationShareEnabledHashes", enabledHashes.map { it.uppercase() }.toSet())
+        putStringSet("NotificationShareDisabledHashes", disabledHashes.map { it.uppercase() }.toSet())
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(
@@ -294,6 +332,16 @@ fun MainScreen(
         }
     }
     val boundDeviceEntries by remember { derivedStateOf { boundMacs.map(::parseBoundDeviceEntry) } }
+    val notificationShareEnabledHashes = remember {
+        mutableStateListOf<String>().apply {
+            addAll(prefs.getStringSet("NotificationShareEnabledHashes", emptySet()).orEmpty().map { it.uppercase() })
+        }
+    }
+    val notificationShareDisabledHashes = remember {
+        mutableStateListOf<String>().apply {
+            addAll(prefs.getStringSet("NotificationShareDisabledHashes", emptySet()).orEmpty().map { it.uppercase() })
+        }
+    }
 
     val myName = remember {
         android.provider.Settings.Global.getString(
@@ -536,6 +584,8 @@ fun MainScreen(
                             myName = myName,
                             myHashStr = myHashStr,
                             prefs = prefs,
+                            notificationShareEnabledHashes = notificationShareEnabledHashes,
+                            notificationShareDisabledHashes = notificationShareDisabledHashes,
                             hazeState = hazeState
                         )
 
@@ -564,6 +614,8 @@ fun DashboardContent(
     myName: String,
     myHashStr: String,
     prefs: android.content.SharedPreferences,
+    notificationShareEnabledHashes: SnapshotStateList<String>,
+    notificationShareDisabledHashes: SnapshotStateList<String>,
     hazeState: dev.chrisbanes.haze.HazeState
 ) {
     val receivedMockMessage by AppConnectionManager.lastReceivedMessage.collectAsState()
@@ -622,6 +674,8 @@ fun DashboardContent(
     val trustedDashboardHashes = remember(boundDeviceEntries) {
         boundDeviceEntries.mapNotNull { it.hash?.uppercase() }.toSet()
     }
+    val explicitNotificationShareEnabled = notificationShareEnabledHashes.map { it.uppercase() }.toSet()
+    val explicitNotificationShareDisabled = notificationShareDisabledHashes.map { it.uppercase() }.toSet()
     val visibleUdpDevices = remember(udpDevices, myHashStr, workMode, trustedDashboardHashes) {
         udpDevices
             .filterNot { it.hash.equals(myHashStr, ignoreCase = true) }
@@ -817,15 +871,25 @@ fun DashboardContent(
             }
             if (visibleUdpDevices.isNotEmpty()) {
                 items(visibleUdpDevices, key = { "online_${it.hash}" }) { device ->
+                    val deviceHash = device.hash.uppercase()
+                    val isBoundDevice = trustedDashboardHashes.contains(deviceHash)
+                    val notificationSharingEnabled = isNotificationSharingEnabled(
+                        hash = device.hash,
+                        defaultEnabled = isBoundDevice,
+                        enabledHashes = explicitNotificationShareEnabled,
+                        disabledHashes = explicitNotificationShareDisabled
+                    )
                     ElevatedCard(
                         modifier = Modifier.fillMaxWidth(),
                         onClick = {
-                            UdpDiscovery.requestBinding(
-                                device.hash,
-                                device.deviceName,
-                                device.role,
-                                device.ipAddress
-                            )
+                            if (workMode == WorkMode.Pairing) {
+                                UdpDiscovery.requestBinding(
+                                    device.hash,
+                                    device.deviceName,
+                                    device.role,
+                                    device.ipAddress
+                                )
+                            }
                         }
                     ) {
                         Row(
@@ -848,18 +912,40 @@ fun DashboardContent(
                                 }
                                 Spacer(modifier = Modifier.height(2.dp))
                                 Text(
-                                    "${device.deviceType} · ${if (device.lanReachable) "局域网可达" else "等待验证"} · ${device.ipAddress} · 端口 ${device.filePort ?: "不可用"}",
+                                    "${device.deviceType} · ${if (isBoundDevice) "已绑定" else "组内设备"} · ${if (device.lanReachable) "局域网可达" else "等待验证"} · ${device.ipAddress} · 端口 ${device.filePort ?: "不可用"}",
                                     fontSize = 12.sp,
                                     color = Color.Gray,
                                     maxLines = 2
                                 )
                             }
-                            if (device.filePort != null && device.lanReachable) {
-                                TextButton(onClick = {
-                                    fileTargetDevice = device
-                                    filePickerLauncher.launch("*/*")
-                                }) {
-                                    Text("发送文件")
+                            Column(
+                                horizontalAlignment = Alignment.End,
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("通知", fontSize = 11.sp, color = Color.Gray)
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Switch(
+                                        checked = notificationSharingEnabled,
+                                        onCheckedChange = { checked ->
+                                            updateNotificationSharing(
+                                                prefs = prefs,
+                                                enabledHashes = notificationShareEnabledHashes,
+                                                disabledHashes = notificationShareDisabledHashes,
+                                                hash = device.hash,
+                                                enabled = checked
+                                            )
+                                        },
+                                        modifier = Modifier.scale(0.78f)
+                                    )
+                                }
+                                if (device.filePort != null && device.lanReachable) {
+                                    TextButton(onClick = {
+                                        fileTargetDevice = device
+                                        filePickerLauncher.launch("*/*")
+                                    }) {
+                                        Text("发送文件")
+                                    }
                                 }
                             }
                         }
@@ -929,6 +1015,13 @@ fun DashboardContent(
                         )
                     } else {
                         sortedBoundDeviceEntries.forEachIndexed { index, entry ->
+                            val entryHash = entry.hash?.uppercase()
+                            val notificationSharingEnabled = isNotificationSharingEnabled(
+                                hash = entryHash,
+                                defaultEnabled = true,
+                                enabledHashes = explicitNotificationShareEnabled,
+                                disabledHashes = explicitNotificationShareDisabled
+                            )
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 verticalAlignment = Alignment.CenterVertically
@@ -947,6 +1040,28 @@ fun DashboardContent(
                                         color = Color.Gray,
                                         maxLines = 2
                                     )
+                                }
+                                if (entryHash != null) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        modifier = Modifier.padding(end = 4.dp)
+                                    ) {
+                                        Text("通知", fontSize = 11.sp, color = Color.Gray)
+                                        Spacer(modifier = Modifier.width(4.dp))
+                                        Switch(
+                                            checked = notificationSharingEnabled,
+                                            onCheckedChange = { checked ->
+                                                updateNotificationSharing(
+                                                    prefs = prefs,
+                                                    enabledHashes = notificationShareEnabledHashes,
+                                                    disabledHashes = notificationShareDisabledHashes,
+                                                    hash = entryHash,
+                                                    enabled = checked
+                                                )
+                                            },
+                                            modifier = Modifier.scale(0.78f)
+                                        )
+                                    }
                                 }
                                 IconButton(onClick = {
                                     removeBoundDeviceEntry(prefs, boundMacs, entry)
@@ -1369,6 +1484,15 @@ private fun startBluetoothAction(
     stateMachine.transitionTo(ConnectionState.AdvertisingOrScanning)
     val context = com.suseoaa.castpigeon.shared.BleContextHolder.applicationContext
     val hashStr = deviceHash.joinToString("") { "%02X".format(it) }
+    if (context != null) {
+        blePeripheral.onPeerAuthorizationRequested = { peerName, peerHash ->
+            BoundDeviceStore.authorizeOrMigratePeer(context, peerName, peerHash).also { accepted ->
+                if (accepted) {
+                    blePeripheral.updateTrustedPeerHashes(BoundDeviceStore.getHashes(context))
+                }
+            }
+        }
+    }
 	    val filePort = com.suseoaa.castpigeon.service.LanFileTransferManager.serverPort.value
         val trustedHashes = boundMacs.mapNotNull { parseBoundDeviceEntry(it).hash }.toSet()
 	    UdpDiscovery.startBroadcasting(
