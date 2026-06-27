@@ -9,6 +9,8 @@ on:
       - "androidApp/build.gradle.kts"
       - "macosApp/CastPigeonMac/Info.plist"
       - "macosApp/CastPigeonMac.xcodeproj/project.pbxproj"
+      - "macosApp/CastPigeonMac/Assets.xcassets/**"
+      - "macosApp/CastPigeonMac/AppIcon.icns"
       - ".github/workflows/release.yml"
       - ".github/scripts/build_changelog.py"
   workflow_dispatch:
