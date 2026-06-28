@@ -47,7 +47,7 @@ cd flutter_app && flutter build macos --debug
 版本号统一来自 `flutter_app/pubspec.yaml`：
 
 ```yaml
-version: 1.0.9+109
+version: 1.0.10+110
 ```
 
 Android 正式 APK 使用 `flutter_app/android/app/build.gradle.kts` 的 release signing 配置。CI 需要以下 GitHub Secrets：
