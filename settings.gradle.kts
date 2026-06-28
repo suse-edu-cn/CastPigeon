@@ -29,6 +29,6 @@ dependencyResolutionManagement {
     }
 }
 
-include(":androidApp")
+include(":androidRuntime")
+include(":kmp_core")
 include(":sharedLogic")
-include(":sharedUI")

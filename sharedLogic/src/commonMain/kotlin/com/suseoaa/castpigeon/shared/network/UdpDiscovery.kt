@@ -29,6 +29,7 @@ data class PinDisplayInfo(
 
 object UdpDiscovery {
     private const val PORT = 48500
+    private const val BINDING_PIN_TTL_MILLIS = 120_000L
     private var listeningJob: Job? = null
     private var broadcastingJob: Job? = null
     
@@ -60,6 +61,7 @@ object UdpDiscovery {
     // 正在处理的配对上下文
     @Volatile private var currentExpectedPin: String? = null
     @Volatile private var currentPairingTargetHash: String? = null
+    @Volatile private var currentPairingPinCreatedAtMillis: Long = 0L
     @Volatile private var pendingBindingTarget: UdpDevice? = null
     @Volatile private var pendingBindingTargetIp: String? = null
 
@@ -106,7 +108,10 @@ object UdpDiscovery {
                         }
 
                     } else if (parts.size >= 5 && parts[0] == "CP_BIND_REQUEST") {
-                        if (!isPairingOpen) continue
+                        if (!isPairingOpen) {
+                            println("UdpDiscovery: ignore bind request because pairing is not open")
+                            continue
+                        }
                         // CP_BIND_REQUEST|TargetHash|RequesterRole|RequesterName|RequesterHash
                         val targetHash = parts[1]
                         if (targetHash == myPairingHash) {
@@ -116,11 +121,8 @@ object UdpDiscovery {
                             if (reqHash == myPairingHash) continue
                             val ip = sanitizeEndpointAddress(datagram.address.toString())
                             val requestingDevice = UdpDevice(reqName, reqRole, reqHash, ip)
-                            
-                            // 收到绑定请求，生成随机 4 位 PIN
-                            val pin = Random.nextInt(1000, 10000).toString()
-                            currentExpectedPin = pin
-                            currentPairingTargetHash = reqHash
+                            val (pin, reused) = pinForBindRequest(reqHash)
+                            println("UdpDiscovery: received bind request requester=$reqHash ip=$ip reusedPin=$reused")
                             
                             // 切换至 Dispatchers.Main 符合官方 UI 线程调度规范
                             withContext(Dispatchers.Main) {
@@ -128,8 +130,11 @@ object UdpDiscovery {
                             }
                         }
 
-	                    } else if (parts.size >= 6 && parts[0] == "CP_BIND_VERIFY") {
-                        if (!isPairingOpen) continue
+                    } else if (parts.size >= 6 && parts[0] == "CP_BIND_VERIFY") {
+                        if (!isPairingOpen) {
+                            println("UdpDiscovery: ignore bind verify because pairing is not open")
+                            continue
+                        }
                         // CP_BIND_VERIFY|TargetHash|RequesterRole|RequesterName|RequesterHash|PIN
                         val targetHash = parts[1]
                         if (targetHash == myPairingHash) {
@@ -141,10 +146,10 @@ object UdpDiscovery {
                             val ip = sanitizeEndpointAddress(datagram.address.toString())
                             val requestingDevice = UdpDevice(reqName, reqRole, reqHash, ip)
 
-                            if (currentExpectedPin == receivedPin && currentPairingTargetHash == reqHash) {
+                            if (isExpectedPairingPin(reqHash, receivedPin)) {
+                                println("UdpDiscovery: bind verify success requester=$reqHash ip=$ip")
                                 // 验证成功
-                                currentExpectedPin = null
-                                currentPairingTargetHash = null
+                                clearPairingPinState()
 
                                 // 回复 SUCCESS
                                 sendUdpMessage("CP_BIND_SUCCESS|$reqHash|$myPairingHash", ip)
@@ -152,7 +157,11 @@ object UdpDiscovery {
                                 withContext(Dispatchers.Main) {
                                     _pairingSuccessEvent.emit(requestingDevice)
                                 }
+                            } else {
+                                println("UdpDiscovery: bind verify failed requester=$reqHash expectedTarget=$currentPairingTargetHash activePin=${currentExpectedPin != null}")
                             }
+                        } else {
+                            println("UdpDiscovery: ignore bind verify target=$targetHash local=$myPairingHash")
                         }
                         
 	                    } else if (parts.size >= 3 && parts[0] == "CP_BIND_SUCCESS") {
@@ -167,11 +176,14 @@ object UdpDiscovery {
                                 ?.copy(ipAddress = sanitizeEndpointAddress(datagram.address.toString()))
                                 ?: _discoveredDevices.value.find { it.hash == senderHash }
                             if (device != null) {
+                                println("UdpDiscovery: bind success received sender=$senderHash ip=${device.ipAddress}")
                                 pendingBindingTarget = null
                                 pendingBindingTargetIp = null
                                 withContext(Dispatchers.Main) {
                                     _pairingSuccessEvent.emit(device)
                                 }
+                            } else {
+                                println("UdpDiscovery: bind success ignored sender=$senderHash has no pending device")
                             }
                         }
                     }
@@ -212,6 +224,9 @@ object UdpDiscovery {
         pairingMode: Boolean = true,
         trustedHashes: Set<String> = emptySet()
     ) {
+        if (myPairingHash != hash || myRole != role || myName != deviceName || !pairingMode) {
+            clearPairingPinState()
+        }
         myPairingHash = hash
         myRole = role
         myName = deviceName
@@ -259,6 +274,7 @@ object UdpDiscovery {
         pendingBindingTarget = UdpDevice(targetDeviceName, targetRole, targetHash, targetIp)
         pendingBindingTargetIp = targetIp
 
+        println("UdpDiscovery: send bind request target=$targetHash ip=$targetIp")
         // 发送 BIND_REQUEST
         sendUdpMessage("CP_BIND_REQUEST|$targetHash|$myRole|$myName|$myPairingHash", targetIp)
         
@@ -269,10 +285,12 @@ object UdpDiscovery {
     }
     
     // UI 输入完 PIN 提交后调用
-    fun verifyBinding(targetHash: String, pin: String) {
+    fun verifyBinding(targetHash: String, pin: String, targetIp: String? = null) {
         if (myRole == null || myName == null || myPairingHash == null) return
+        val destinationIp = targetIp?.takeIf { it.isNotBlank() } ?: pendingBindingTargetIp
+        println("UdpDiscovery: send bind verify target=$targetHash ip=${destinationIp ?: "broadcast"}")
         // 发送 BIND_VERIFY
-        sendUdpMessage("CP_BIND_VERIFY|$targetHash|$myRole|$myName|$myPairingHash|$pin", pendingBindingTargetIp)
+        sendUdpMessage("CP_BIND_VERIFY|$targetHash|$myRole|$myName|$myPairingHash|$pin", destinationIp)
     }
 
     private fun sendUdpMessage(msg: String, targetIp: String? = null) {
@@ -320,12 +338,55 @@ object UdpDiscovery {
         isPairingOpen = false
         trustedPeerHashes = emptySet()
         currentBroadcastMessage = null
-        currentExpectedPin = null
-        currentPairingTargetHash = null
+        clearPairingPinState()
         pendingBindingTarget = null
         pendingBindingTargetIp = null
         _discoveredDevices.value = emptySet()
         UdpPlatformSupport.releaseMulticastLock()
+    }
+
+    private fun pinForBindRequest(requesterHash: String): Pair<String, Boolean> {
+        val nowMillis = currentTimeMillis()
+        val existingPin = currentExpectedPin
+        if (
+            existingPin != null &&
+            currentPairingTargetHash == requesterHash &&
+            !isPairingPinExpired(nowMillis)
+        ) {
+            return existingPin to true
+        }
+
+        val pin = Random.nextInt(1000, 10000).toString()
+        currentExpectedPin = pin
+        currentPairingTargetHash = requesterHash
+        currentPairingPinCreatedAtMillis = nowMillis
+        return pin to false
+    }
+
+    private fun isExpectedPairingPin(requesterHash: String, pin: String): Boolean {
+        val nowMillis = currentTimeMillis()
+        val matches = currentExpectedPin == pin &&
+            currentPairingTargetHash == requesterHash &&
+            !isPairingPinExpired(nowMillis)
+        if (!matches && currentPairingTargetHash == requesterHash && isPairingPinExpired(nowMillis)) {
+            clearPairingPinState()
+        }
+        return matches
+    }
+
+    private fun isPairingPinExpired(nowMillis: Long): Boolean {
+        val createdAtMillis = currentPairingPinCreatedAtMillis
+        return createdAtMillis <= 0L || nowMillis - createdAtMillis > BINDING_PIN_TTL_MILLIS
+    }
+
+    private fun clearPairingPinState() {
+        currentExpectedPin = null
+        currentPairingTargetHash = null
+        currentPairingPinCreatedAtMillis = 0L
+    }
+
+    private fun currentTimeMillis(): Long {
+        return kotlin.time.Clock.System.now().toEpochMilliseconds()
     }
 
     private fun sanitizeEndpointAddress(raw: String): String {

@@ -7,13 +7,15 @@ BUNDLE_IDS=(
   "com.yourcompany.notilinker.macos"
   "com.suseoaa.castpigeon.macos"
   "com.suseoaa.castpigeon.macos.debug"
+  "com.suseoaa.castpigeon.castpigeonFlutter"
+  "com.suseoaa.Castpigeon"
 )
 
 APP_PATHS=(
   "/Applications/CastPigeon.app"
-  "/Applications/CastPigeonMac.app"
+  "/Applications/castpigeon_flutter.app"
   "$HOME/Applications/CastPigeon.app"
-  "$HOME/Applications/CastPigeonMac.app"
+  "$HOME/Applications/castpigeon_flutter.app"
 )
 
 if [ -d "$HOME/Library/Developer/Xcode/DerivedData" ]; then
@@ -21,7 +23,7 @@ if [ -d "$HOME/Library/Developer/Xcode/DerivedData" ]; then
     APP_PATHS+=("$app_path")
   done < <(
     find "$HOME/Library/Developer/Xcode/DerivedData" \
-      \( -path "*/Build/Products/*/CastPigeon.app" -o -path "*/Build/Products/*/CastPigeonMac.app" \) \
+      \( -path "*/Build/Products/*/CastPigeon.app" -o -path "*/Build/Products/*/castpigeon_flutter.app" \) \
       -type d 2>/dev/null
   )
 fi

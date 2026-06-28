@@ -1,0 +1,2 @@
+headers = dart_api_shim.h
+package = com.castpigeon.core.ffi.dartapi

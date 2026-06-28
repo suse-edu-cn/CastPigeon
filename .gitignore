@@ -54,6 +54,12 @@ build/
 # ====================================================================
 node_modules/
 
+# Flutter local/generated workspace state
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/*.iml
+
 # ====================================================================
 # 6. Android / Kotlin 编译及发布产物
 # ====================================================================
