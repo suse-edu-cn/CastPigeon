@@ -185,6 +185,12 @@ jobs:
             echo "使用 Xcode: $LATEST_XCODE"
           fi
 
+          flutter build macos --release --config-only \
+            --build-name "${{ needs.check_version.outputs.release_version }}" \
+            --build-number "${{ needs.check_version.outputs.release_build_number }}"
+          test -f macos/Flutter/ephemeral/FlutterInputs.xcfilelist
+          test -f macos/Flutter/ephemeral/FlutterOutputs.xcfilelist
+
           xcodebuild \
             -workspace macos/Runner.xcworkspace \
             -scheme Runner \
