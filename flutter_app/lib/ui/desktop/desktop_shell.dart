@@ -82,29 +82,12 @@ class _DesktopSidebar extends StatelessWidget {
     return Container(
       width: 248,
       color: colors.surface,
-      padding: const EdgeInsets.fromLTRB(14, 16, 14, 16),
+      padding: const EdgeInsets.fromLTRB(14, 56, 14, 16),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Row(
-            children: [
-              const _BrandLogo(size: 36, borderRadius: 8),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('投鸽', style: _titleStyle(context)),
-                    Text(
-                      snapshot.localDeviceName,
-                      style: _captionStyle(context),
-                    ),
-                  ],
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 18),
+          _DesktopBrandCard(snapshot: snapshot),
+          const SizedBox(height: 14),
           for (final tab in AppTab.values) ...[
             _DesktopNavButton(
               tab: tab,
@@ -157,6 +140,52 @@ class _DesktopSidebar extends StatelessWidget {
                 const SizedBox(height: 6),
                 Text(
                   snapshot.localDeviceHash,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: _captionStyle(context),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DesktopBrandCard extends StatelessWidget {
+  const _DesktopBrandCard({required this.snapshot});
+
+  final CastPigeonSnapshot snapshot;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: _surfaceCardColor(context),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: _outlineColor(context)),
+        boxShadow: [
+          BoxShadow(
+            color: _shadowColor(context).withValues(alpha: 0.10),
+            blurRadius: 8,
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Row(
+        children: [
+          const _BrandLogo(size: 36, borderRadius: 8),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('投鸽', style: _titleStyle(context)),
+                Text(
+                  snapshot.localDeviceName,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: _captionStyle(context),

@@ -99,28 +99,28 @@ class _CastPigeonHomeState extends State<CastPigeonHome> {
     final isDesktop = _isDesktopPlatform;
     return Scaffold(
       backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-      body: SafeArea(
-        child: isDesktop
-            ? _DesktopShell(
-                api: widget.api,
-                snapshot: _snapshot,
-                themeController: widget.themeController,
-                selected: _tab,
-                onSelect: _selectTab,
-                showPairingSheet:
-                    _showMacPairingSheet ||
-                    _snapshot.pinDisplay != null ||
-                    _snapshot.pinInputDevice != null,
-                onStartPairing: () {
-                  setState(() => _showMacPairingSheet = true);
-                  unawaited(widget.api.startPairing());
-                },
-                onClosePairing: () {
-                  setState(() => _showMacPairingSheet = false);
-                  unawaited(widget.api.stop());
-                },
-              )
-            : Stack(
+      body: isDesktop
+          ? _DesktopShell(
+              api: widget.api,
+              snapshot: _snapshot,
+              themeController: widget.themeController,
+              selected: _tab,
+              onSelect: _selectTab,
+              showPairingSheet:
+                  _showMacPairingSheet ||
+                  _snapshot.pinDisplay != null ||
+                  _snapshot.pinInputDevice != null,
+              onStartPairing: () {
+                setState(() => _showMacPairingSheet = true);
+                unawaited(widget.api.startPairing());
+              },
+              onClosePairing: () {
+                setState(() => _showMacPairingSheet = false);
+                unawaited(widget.api.stop());
+              },
+            )
+          : SafeArea(
+              child: Stack(
                 children: [
                   Positioned.fill(child: _buildMobileTabSwitcher()),
                   Align(
@@ -133,7 +133,7 @@ class _CastPigeonHomeState extends State<CastPigeonHome> {
                   _SnapshotDialogs(api: widget.api, snapshot: _snapshot),
                 ],
               ),
-      ),
+            ),
     );
   }
 
