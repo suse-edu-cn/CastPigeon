@@ -28,15 +28,13 @@ def append_unique(target: OrderedDict[str, None], value: str) -> None:
         target.setdefault(clean_value, None)
 
 
-def classify_subjects(subjects: list[str]) -> tuple[list[str], list[str], list[str]]:
+def classify_subjects(subjects: list[str]) -> tuple[list[str], list[str]]:
     features: OrderedDict[str, None] = OrderedDict()
     fixes: OrderedDict[str, None] = OrderedDict()
-    others: OrderedDict[str, None] = OrderedDict()
 
     for subject in subjects:
         match = re.match(r"^(feat|fix)(?:\([^)]+\))?!?:\s*(.+)$", subject, re.IGNORECASE)
         if not match:
-            append_unique(others, subject)
             continue
 
         kind = match.group(1).lower()
@@ -46,7 +44,7 @@ def classify_subjects(subjects: list[str]) -> tuple[list[str], list[str], list[s
         elif kind == "fix":
             append_unique(fixes, content)
 
-    return list(features.keys()), list(fixes.keys()), list(others.keys())
+    return list(features.keys()), list(fixes.keys())
 
 
 def append_section(lines: list[str], title: str, entries: list[str]) -> None:
@@ -58,8 +56,8 @@ def append_section(lines: list[str], title: str, entries: list[str]) -> None:
     lines.append("")
 
 
-def build_markdown(version: str, previous_tag: str | None, subjects: list[str], platform: str | None = None) -> str:
-    features, fixes, others = classify_subjects(subjects)
+def build_markdown(version: str, subjects: list[str], platform: str | None = None) -> str:
+    features, fixes = classify_subjects(subjects)
     release_title = f"CastPigeon {platform} v{version}" if platform else f"CastPigeon v{version}"
     lines = [
         f"## {release_title}",
@@ -68,21 +66,6 @@ def build_markdown(version: str, previous_tag: str | None, subjects: list[str], 
 
     append_section(lines, "功能更新", features)
     append_section(lines, "问题修复", fixes)
-    append_section(lines, "其他更新", others)
-
-    if not features and not fixes and not others:
-        lines.extend([
-            "### 其他更新",
-            f"- 发布 {release_title}",
-            "",
-        ])
-
-    if previous_tag:
-        lines.extend([
-            "### 发布范围",
-            f"- {previous_tag}..HEAD",
-            "",
-        ])
 
     return "\n".join(lines).strip() + "\n"
 
@@ -97,7 +80,7 @@ def main() -> None:
 
     previous_tag = latest_tag(args.tag_prefix)
     subjects = commit_subjects(previous_tag)
-    markdown = build_markdown(args.version, previous_tag, subjects, args.platform)
+    markdown = build_markdown(args.version, subjects, args.platform)
     Path(args.output).write_text(markdown, encoding="utf-8")
 
 
