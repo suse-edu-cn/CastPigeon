@@ -78,7 +78,17 @@ object BoundDeviceStore {
 
         val entries = getEntries(context)
         val matchedRaw = entries.firstOrNull { raw ->
-            parse(raw).hash?.equals(normalizedHash, ignoreCase = true) == true
+            val entry = parse(raw)
+            entry.hash?.equals(normalizedHash, ignoreCase = true) == true ||
+                (
+                    entry.hash == null &&
+                        peerName.isNotBlank() &&
+                        entry.name == peerName &&
+                        (
+                            entry.deviceType.equals("Mac", ignoreCase = true) ||
+                                entry.deviceType.equals("Unknown", ignoreCase = true)
+                            )
+                    )
         } ?: return
 
         val oldEntry = parse(matchedRaw)

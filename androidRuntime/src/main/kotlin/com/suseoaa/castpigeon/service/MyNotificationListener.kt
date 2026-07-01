@@ -1,7 +1,9 @@
 package com.suseoaa.castpigeon.service
 
 import android.app.Notification
+import android.content.ComponentName
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
@@ -17,6 +19,7 @@ import androidx.core.graphics.createBitmap
 import androidx.core.graphics.scale
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
@@ -28,8 +31,29 @@ class MyNotificationListener : NotificationListenerService() {
         private const val TAG = "NotificationLinker"
     }
 
-    // 引入该服务独立的协程生命周期控制体
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    // 通知监听在 MIUI 等系统上可能被系统断开后复用同一个 Service 实例。
+    // Scope 被 cancel 后必须在重新连接时重建，否则后续通知会被投递到已取消的协程上下文。
+    private val scopeLock = Any()
+    private var serviceScope = newServiceScope()
+
+    private fun newServiceScope(): CoroutineScope {
+        return CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    }
+
+    private fun activeServiceScope(): CoroutineScope = synchronized(scopeLock) {
+        val job = serviceScope.coroutineContext[Job]
+        if (job?.isActive != true) {
+            serviceScope = newServiceScope()
+            Log.i(TAG, "NotificationListener coroutine scope recreated")
+        }
+        serviceScope
+    }
+
+    private fun cancelServiceScope() {
+        synchronized(scopeLock) {
+            serviceScope.cancel()
+        }
+    }
 
     private fun getAppIconBase64(packageName: String): String? {
         var bitmap: Bitmap? = null
@@ -66,14 +90,18 @@ class MyNotificationListener : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        activeServiceScope()
         Log.i(TAG, "NotificationListener connected -- service is active")
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
         Log.w(TAG, "NotificationListener disconnected -- service is inactive")
-        // 当服务切断时销毁子协程任务
-        serviceScope.cancel()
+        // 当服务切断时销毁子协程任务；系统重新连接时会按需重建 scope。
+        cancelServiceScope()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            requestRebind(ComponentName(this, MyNotificationListener::class.java))
+        }
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
@@ -109,7 +137,7 @@ class MyNotificationListener : NotificationListenerService() {
             }
 
             // 将高强度的图片解析、压缩和编码逻辑整体丢入后台默认协程池处理，严禁阻塞监听主线程
-            serviceScope.launch {
+            activeServiceScope().launch {
                 if (AppManager.isAppAllowed(sbn.packageName)) {
                     val messageId = "${sbn.key}_${sbn.postTime}"
                     val iconBase64 = getAppIconBase64(sbn.packageName)
@@ -140,6 +168,6 @@ class MyNotificationListener : NotificationListenerService() {
 
     override fun onDestroy() {
         super.onDestroy()
-        serviceScope.cancel()
+        cancelServiceScope()
     }
 }
